@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Spoke-account IAM role for Route 53 cross-account private hosted zone sharing.
+  Deployed to every account in the org via StackSet. Assumed by the dedicated
+  instance role (CloudInfraEc2Role) in the tooling account
+  (344327960130) that runs the zone-sharing automation.
+  Scoped to Route 53 VPC-association (zone sharing) actions -- NOT full IAM.
+
+  This replaces reliance on the broad Cloud9Role for zone sharing.
+
+Parameters:
+  ToolingAccountId:
+    Type: String
+    Default: '344327960130'
+    Description: Account hosting the zone-sharing automation (EC2 web server).
+  TrustedRoleName:
+    Type: String
+    Default: 'CloudInfraEc2Role'
+    Description: Name of the instance role in the tooling account allowed to assume this role.
+  ZoneSharingRoleName:
+    Type: String
+    Default: 'CsaaRoute53ZoneSharingRole'
+    Description: Name of the role created in every account (stable/predictable for the automation).
+
+Resources:
+  Route53ZoneSharingRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref ZoneSharingRoleName
+      Description: 'Cross-account Route53 private hosted zone sharing (VPC association).'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${ToolingAccountId}:role/${TrustedRoleName}'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'Route53ZoneSharing'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Zone-owner side: authorize another account's VPC to associate.
+              - Sid: 'VpcAssociationAuthorization'
+                Effect: Allow
+                Action:
+                  - 'route53:CreateVPCAssociationAuthorization'
+                  - 'route53:DeleteVPCAssociationAuthorization'
+                  - 'route53:ListVPCAssociationAuthorizations'
+                Resource: '*'
+              # Consumer side: associate/disassociate a VPC with a shared zone.
+              - Sid: 'VpcAssociation'
+                Effect: Allow
+                Action:
+                  - 'route53:AssociateVPCWithHostedZone'
+                  - 'route53:DisassociateVPCFromHostedZone'
+                Resource: '*'
+              # Supporting reads for validation / discovery.
+              - Sid: 'Route53Read'
+                Effect: Allow
+                Action:
+                  - 'route53:GetHostedZone'
+                  - 'route53:ListHostedZones'
+                  - 'route53:ListHostedZonesByName'
+                  - 'route53:ListResourceRecordSets'
+                Resource: '*'
+              # Validate VPC IDs involved in associations.
+              - Sid: 'DescribeVpcs'
+                Effect: Allow
+                Action:
+                  - 'ec2:DescribeVpcs'
+                Resource: '*'
+      Tags:
+        - Key: 'csaa:cost-center'
+          Value: '26860'
+        - Key: 'csaa:support-group'
+          Value: 'Cloud Infrastructure'
+        - Key: 'csaa:contact'
+          Value: 'dlcloudinfrastructure@csaa.com'
+        - Key: 'csaa:application'
+          Value: 'aws'
+        - Key: 'csaa:environment'
+          Value: 'prod'
+
+Outputs:
+  RoleArn:
+    Description: ARN of the zone-sharing role (same name in every account).
+    Value: !GetAtt Route53ZoneSharingRole.Arn
+  RoleName:
+    Value: !Ref ZoneSharingRoleName

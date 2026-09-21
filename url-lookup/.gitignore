@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local test output / scratch
+*.log
+*-output.txt
+lockout-check-output.txt
+settings-check-output.txt
+lambda-error-output.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# AWS local artifacts (never commit creds or CA bundles)
+*.pem
+ca-bundle.crt
+.aws/

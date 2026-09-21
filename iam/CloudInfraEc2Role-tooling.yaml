@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Instance role for the EC2 web server(s) in the tooling account (344327960130)
+  that run the Route 53 zone-sharing automation AND the URL-infra-resolver tool.
+  Replaces the full-IAM Cloud9Role for this workload with a least-privilege role.
+
+  This role can:
+    - Assume the zone-sharing + resolver-read spoke roles in every account.
+    - Query the org Config aggregator (URL resolver: zone discovery + ENI attribution).
+    - Read Route 53 in THIS (tooling) account directly (for zones that live here).
+  It does NOT have full IAM or any broad permissions.
+
+  Deploy ONLY in the tooling account 344327960130 (not org-wide).
+
+Parameters:
+  ZoneSharingSpokeRoleName:
+    Type: String
+    Default: 'CsaaRoute53ZoneSharingRole'
+    Description: Name of the zone-sharing role deployed to every spoke account.
+  ResolverReadSpokeRoleName:
+    Type: String
+    Default: 'CsaaInfraResolverReadRole'
+    Description: Name of the read-only resolver role deployed to every spoke account.
+  InstanceRoleName:
+    Type: String
+    Default: 'CloudInfraEc2Role'
+    Description: Name of the instance role created in the tooling account.
+
+Resources:
+  InstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref InstanceRoleName
+      Description: 'Least-privilege instance role for zone-sharing + URL resolver automation.'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'ec2.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      # SSM core so the instance stays reachable via Session Manager.
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: 'AssumeSpokeRoles'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Assume the zone-sharing role in any account.
+              - Sid: 'AssumeZoneSharingRole'
+                Effect: Allow
+                Action: 'sts:AssumeRole'
+                Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/${ZoneSharingSpokeRoleName}'
+              # Assume the resolver read role in any account.
+              - Sid: 'AssumeResolverReadRole'
+                Effect: Allow
+                Action: 'sts:AssumeRole'
+                Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/${ResolverReadSpokeRoleName}'
+        - PolicyName: 'ConfigAggregatorRead'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read the org Config aggregator (URL resolver: zone discovery + ENI attribution).
+              - Sid: 'ConfigAggregatorQuery'
+                Effect: Allow
+                Action:
+                  - 'config:SelectAggregateResourceConfig'
+                  - 'config:BatchGetAggregateResourceConfig'
+                  - 'config:GetAggregateResourceConfig'
+                  - 'config:DescribeConfigurationAggregators'
+                  - 'config:SelectResourceConfig'
+                Resource: '*'
+        - PolicyName: 'Route53ReadLocal'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Route 53 read for the URL resolver when a matching hosted zone
+              # lives in THIS (tooling) account -- the resolver reads it directly
+              # via the base session (no assume-role). Reads in OTHER accounts go
+              # through the assumed CsaaInfraResolverReadRole instead.
+              - Sid: 'Route53ReadInToolingAccount'
+                Effect: Allow
+                Action:
+                  - 'route53:GetHostedZone'
+                  - 'route53:ListHostedZones'
+                  - 'route53:ListHostedZonesByName'
+                  - 'route53:ListResourceRecordSets'
+                Resource: '*'
+        - PolicyName: 'UrlResolverAuditWrite'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Write one audit record per URL lookup to the csaa-url-resolver
+              # DynamoDB table in this (tooling) account.
+              - Sid: 'AuditPutItem'
+                Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/csaa-url-resolver'
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/csaa-url-resolver/index/*'
+      Tags:
+        - Key: 'csaa:cost-center'
+          Value: '26860'
+        - Key: 'csaa:support-group'
+          Value: 'Cloud Infrastructure'
+        - Key: 'csaa:contact'
+          Value: 'dlcloudinfrastructure@csaa.com'
+        - Key: 'csaa:application'
+          Value: 'aws'
+        - Key: 'csaa:environment'
+          Value: 'prod'
+
+  InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: !Ref InstanceRoleName
+      Roles:
+        - !Ref InstanceRole
+
+Outputs:
+  InstanceRoleArn:
+    Description: ARN of the new instance role. Use this as the trusted principal in the spoke role trust policies.
+    Value: !GetAtt InstanceRole.Arn
+  InstanceRoleName:
+    Value: !Ref InstanceRoleName
+  InstanceProfileName:
+    Description: Attach this instance profile to i-09daf85c55e1ab7f7 (and the prod instance).
+    Value: !Ref InstanceProfile

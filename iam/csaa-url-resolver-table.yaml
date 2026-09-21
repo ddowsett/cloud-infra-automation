@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DynamoDB table 'csaa-url-resolver' for the URL-to-Infrastructure Resolver tool.
+  Stores an audit record of every URL lookup performed via the tool.
+  Deploy in the tooling account 344327960130 only.
+
+Parameters:
+  TableName:
+    Type: String
+    Default: 'csaa-url-resolver'
+    Description: Name of the audit table.
+
+Resources:
+  UrlResolverTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: 'lookup_id'
+          AttributeType: 'S'
+        - AttributeName: 'hostname'
+          AttributeType: 'S'
+        - AttributeName: 'timestamp'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'lookup_id'
+          KeyType: 'HASH'
+      # GSI so you can query audit history by hostname over time.
+      GlobalSecondaryIndexes:
+        - IndexName: 'hostname-timestamp-index'
+          KeySchema:
+            - AttributeName: 'hostname'
+              KeyType: 'HASH'
+            - AttributeName: 'timestamp'
+              KeyType: 'RANGE'
+          Projection:
+            ProjectionType: ALL
+      # Records are retained INDEFINITELY -- no TTL / auto-expiry configured.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: 'csaa:cost-center'
+          Value: '26860'
+        - Key: 'csaa:support-group'
+          Value: 'Cloud Infrastructure'
+        - Key: 'csaa:contact'
+          Value: 'dlcloudinfrastructure@csaa.com'
+        - Key: 'csaa:application'
+          Value: 'aws'
+        - Key: 'csaa:environment'
+          Value: 'prod'
+
+Outputs:
+  TableName:
+    Value: !Ref UrlResolverTable
+  TableArn:
+    Value: !GetAtt UrlResolverTable.Arn

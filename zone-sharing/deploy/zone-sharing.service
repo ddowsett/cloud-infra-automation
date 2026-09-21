@@ -1,0 +1,19 @@
+[Unit]
+Description=CSAA Route 53 Zone Sharing (Flask, /zone-sharing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zonesharing
+Group=zonesharing
+WorkingDirectory=/opt/cloud-infra-automation/zone-sharing
+# Bind to loopback only -- nginx fronts it at /zone-sharing/.
+# The Flask module exposes `app`; served via gunicorn for production.
+ExecStart=/opt/cloud-infra-automation/zone-sharing/venv/bin/gunicorn \
+    --bind 127.0.0.1:8080 --workers 2 ShareHostedZoneAutomation:app
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

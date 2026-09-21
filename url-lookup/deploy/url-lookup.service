@@ -1,0 +1,24 @@
+[Unit]
+Description=CSAA URL Infrastructure Resolver (FastAPI, /url-lookup)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as a non-root service account; adjust User/Group to your standard.
+User=urllookup
+Group=urllookup
+WorkingDirectory=/opt/cloud-infra-automation/url-lookup
+# Environment overrides (all optional -- code has sane defaults):
+#   RESOLVER_AGGREGATOR, RESOLVER_AGGREGATOR_REGION, RESOLVER_ASSUME_ROLE,
+#   RESOLVER_AUDIT_TABLE, RESOLVER_AUDIT_REGION
+# Bind to loopback only -- nginx fronts it at /url-lookup/. root-path makes
+# FastAPI generate correct URLs behind the reverse-proxy prefix.
+ExecStart=/opt/cloud-infra-automation/url-lookup/venv/bin/uvicorn app:app \
+    --host 127.0.0.1 --port 8000 --root-path /url-lookup
+Restart=on-failure
+RestartSec=3
+# IMDSv2 enforcement is set at the instance level, not here.
+
+[Install]
+WantedBy=multi-user.target

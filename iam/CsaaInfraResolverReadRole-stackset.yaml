@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Least-privilege read role for the URL-to-Infrastructure Resolver tool.
+  Deployed to every account in the org via StackSet. Trusts the dedicated
+  instance role (CloudInfraEc2Role) in the tooling account
+  (344327960130) so the resolver can read Route 53 record sets in each account's
+  private hosted zones. Route 53 read ONLY -- no write, no other services.
+
+Parameters:
+  ToolingAccountId:
+    Type: String
+    Default: '344327960130'
+    Description: Account hosting the resolver EC2 instance.
+  TrustedRoleName:
+    Type: String
+    Default: 'CloudInfraEc2Role'
+    Description: Name of the instance role in the tooling account allowed to assume this role.
+  ResolverRoleName:
+    Type: String
+    Default: 'CsaaInfraResolverReadRole'
+    Description: Name of the role created in every account (must be stable/predictable).
+
+Resources:
+  InfraResolverReadRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Ref ResolverRoleName
+      Description: 'Read-only Route53 role assumed by the URL-infra-resolver tool.'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${ToolingAccountId}:role/${TrustedRoleName}'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'Route53ReadOnly'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: 'Route53ReadRecords'
+                Effect: Allow
+                Action:
+                  - 'route53:ListHostedZones'
+                  - 'route53:ListHostedZonesByName'
+                  - 'route53:GetHostedZone'
+                  - 'route53:ListResourceRecordSets'
+                Resource: '*'
+      Tags:
+        - Key: 'csaa:cost-center'
+          Value: '26860'
+        - Key: 'csaa:support-group'
+          Value: 'Cloud Infrastructure'
+        - Key: 'csaa:contact'
+          Value: 'dlcloudinfrastructure@csaa.com'
+        - Key: 'csaa:application'
+          Value: 'aws'
+        - Key: 'csaa:environment'
+          Value: 'prod'
+
+Outputs:
+  RoleArn:
+    Description: ARN of the created read role (same name in every account).
+    Value: !GetAtt InfraResolverReadRole.Arn
+  RoleName:
+    Description: Role name (used by the resolver to build per-account ARNs).
+    Value: !Ref ResolverRoleName
