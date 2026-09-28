@@ -30,6 +30,10 @@ for f in ShareHostedZoneAutomation.py requirements.txt; do
   sudo cp "./$f" "$APP_DIR/$f"
 done
 
+# Bundle the static front-end (index.html) with the app.
+sudo mkdir -p "$APP_DIR/static"
+sudo cp ./static/index.html "$APP_DIR/static/index.html"
+
 echo "== 4. Python venv + deps =="
 if [ ! -d "$APP_DIR/venv" ]; then
   sudo python3 -m venv "$APP_DIR/venv"
