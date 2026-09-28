@@ -85,6 +85,6 @@ Expected: resolves to the `kh-test-progress` internal ELB in account
   ALB injecting the user (the app honors `x-amzn-oidc-identity`/`x-forwarded-user`).
   Add auth before broad ("all users") exposure.
 - **IMDSv2**: ensure the instance enforces `HttpTokens=required`.
-- **zone-sharing** serves `index.html` from `/var/www/html`; confirm its form
-  action is prefix-safe when reached via `/zone-sharing/` (nginx strips the prefix).
+- **zone-sharing** zone-sharing serves index.html from its bundled static/ folder; the form action is relative (create-vpc-association)
+    so it stays prefix-safe when reached via /zone-sharing/ (nginx strips the prefix)..
 - **TLS**: this config listens on :80. Add a TLS server block / cert for prod.
