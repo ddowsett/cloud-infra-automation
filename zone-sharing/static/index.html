@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>CSAA Route 53 Zone Sharing</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; color: #1a1a1a; }
+    h1 { font-size: 1.3rem; }
+    p.muted { color: #666; max-width: 640px; }
+    form { max-width: 640px; margin-top: 1rem; }
+    label { display: block; margin: .8rem 0 .2rem; font-weight: 600; font-size: .9rem; }
+    input { width: 100%; padding: .55rem .7rem; font-size: 1rem; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+    .hint { color: #888; font-weight: 400; font-size: .8rem; }
+    button { margin-top: 1.2rem; padding: .6rem 1.2rem; font-size: 1rem; border: 0; border-radius: 6px; background: #1662d4; color: #fff; cursor: pointer; }
+    button:disabled { background: #9bb7e8; }
+    #out { margin-top: 1.4rem; max-width: 860px; }
+    pre { background: #f6f8fa; padding: .9rem; border-radius: 6px; overflow: auto; font-size: .85rem; }
+    .ok { color: #137333; } .err { color: #c5221f; }
+  </style>
+</head>
+<body>
+  <h1>Route 53 Private Hosted Zone Sharing</h1>
+  <p class="muted">
+    Associates a VPC in a requesting account with a private hosted zone owned by a
+    shared-services account. Runs the authorize &rarr; associate &rarr; cleanup handshake.
+  </p>
+
+  <form id="f">
+    <label>Shared Services Account ID
+      <span class="hint">(account that owns the hosted zone)</span></label>
+    <input id="ss_account" name="ss_account" type="text" placeholder="123456789012" required />
+
+    <label>Requesting Account ID
+      <span class="hint">(account whose VPC will be associated)</span></label>
+    <input id="requesting_account" name="requesting_account" type="text" placeholder="123456789012" required />
+
+    <label>AWS Region</label>
+    <input id="aws_region" name="aws_region" type="text" placeholder="us-west-2" value="us-west-2" required />
+
+    <label>VPC ID
+      <span class="hint">(the VPC to associate, in the requesting account)</span></label>
+    <input id="vpc_id" name="vpc_id" type="text" placeholder="vpc-0123456789abcdef0" required />
+
+    <label>Hosted Zone ID
+      <span class="hint">(the private hosted zone in shared services)</span></label>
+    <input id="hosted_zone_id" name="hosted_zone_id" type="text" placeholder="Z0123456789ABCDEFGHIJ" required />
+
+    <button id="go" type="submit">Associate VPC</button>
+  </form>
+
+  <div id="out"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    function esc(s){ return (s==null?'':String(s)).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+    $('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      $('go').disabled = true;
+      $('out').innerHTML = '<p class="muted">Submitting association request…</p>';
+
+      // The backend expects form-encoded fields (request.form.get(...)).
+      const data = new URLSearchParams();
+      ['ss_account','requesting_account','aws_region','vpc_id','hosted_zone_id']
+        .forEach(k => data.append(k, $(k).value.trim()));
+
+      try {
+        // Relative path -> works both directly and behind nginx at /zone-sharing/.
+        const r = await fetch('create-vpc-association', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: data.toString()
+        });
+        const d = await r.json();
+        if (r.ok) {
+          $('out').innerHTML = '<p class="ok"><b>Success</b> — VPC associated with hosted zone.</p>'
+            + '<pre>' + esc(JSON.stringify(d, null, 2)) + '</pre>';
+        } else {
+          $('out').innerHTML = '<p class="err"><b>Error</b>: ' + esc(d.error || r.status) + '</p>'
+            + '<pre>' + esc(JSON.stringify(d, null, 2)) + '</pre>';
+        }
+      } catch (err) {
+        $('out').innerHTML = '<p class="err">Request failed: ' + esc(err) + '</p>';
+      } finally {
+        $('go').disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
