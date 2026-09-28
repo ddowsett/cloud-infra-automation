@@ -1,6 +1,11 @@
 from flask import Flask, request, jsonify, send_from_directory
 import boto3
 import logging
+import os
+
+# ... existing imports (flask, boto3, logging) ...
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -9,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Serve HTML form
 @app.route('/')
 def serve_form():
-    return send_from_directory('/var/www/html', 'index.html')
+    return send_from_directory(STATIC_DIR, 'index.html')
 
 
 # STS Assume Role Helper
