@@ -3,17 +3,18 @@ Core resolver: URL -> infrastructure location.
 
 Chain:
   1. Resolve the hostname via DNS (live) to IP address(es).
-  2. Look up the Route 53 record for the hostname to capture alias targets
-     (API Gateway / CloudFront / ELB aliases name the resource directly, which
-     is more precise than IP attribution).
-  3. For each resolved private IP, query the AWS Config org aggregator
-     ('us-regions') for the owning ENI -> accountId, region, resourceId, and the
-     ENI description (which reveals the service + workload).
+  2. Look up the Route 53 record for the hostname -- discovering candidate hosted
+     zones across ALL accounts via the AWS Config org aggregator, then reading the
+     exact record in each zone-owning account (assuming CsaaInfraResolverReadRole).
+     Captures alias targets (ELB/API GW/CloudFront) and plain A-record values.
+  3. Attribute each private IP (from live DNS, from A-record values, or from an
+     alias target's ELB) to an owning account + resource by querying the Config
+     aggregator for the ENI (AWS::EC2::NetworkInterface).
   4. Classify the resource type from the ENI description / interface type.
 
-Credentials: uses the default boto3 credential chain. On the EC2 instance this
-is the instance profile. For local testing, pass an AWS profile name as the
-last CLI arg.
+Credentials: uses the default boto3 credential chain. On the EC2 instance this is
+the CloudInfraEc2Role instance profile. For local testing, pass an AWS profile
+name as the last CLI arg.
 
 Read-only: performs only DNS lookups and Config/Route53 describe/select calls.
 """
@@ -23,13 +24,11 @@ from __future__ import annotations
 import ipaddress
 import socket
 import re
+import os
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 import boto3
-
-
-import os
 
 # Config aggregator covering the org across US regions (us-east-1/2, us-west-1/2).
 DEFAULT_AGGREGATOR = os.environ.get("RESOLVER_AGGREGATOR", "us-regions")
@@ -37,7 +36,6 @@ AGGREGATOR_REGION = os.environ.get("RESOLVER_AGGREGATOR_REGION", "us-west-2")
 # Cross-account read role deployed to every account via StackSet. Overridable at
 # deploy time. No ExternalId -- trust is scoped to the CloudInfraEc2Role principal.
 ASSUME_ROLE_NAME = os.environ.get("RESOLVER_ASSUME_ROLE", "CsaaInfraResolverReadRole")
-
 
 @dataclass
 class ResourceMatch:
@@ -49,7 +47,8 @@ class ResourceMatch:
     interface_type: Optional[str] = None
     resource_type: Optional[str] = None
     workload_hint: Optional[str] = None
-
+    attached_instance_id: Optional[str] = None
+    source: Optional[str] = None  # how this match was found: dns-ip | a-record-ip | alias
 
 @dataclass
 class ZoneRecord:
@@ -60,7 +59,6 @@ class ZoneRecord:
     record_type: Optional[str] = None
     alias_target: Optional[str] = None
     values: list = field(default_factory=list)   # non-alias record values (A/CNAME)
-
 
 @dataclass
 class ResolveResult:
@@ -77,7 +75,6 @@ class ResolveResult:
     def to_dict(self):
         return asdict(self)
 
-
 def _hostname_from_url(url: str) -> str:
     h = url.strip()
     h = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", h)
@@ -85,13 +82,11 @@ def _hostname_from_url(url: str) -> str:
     h = h.split(":")[0]
     return h.rstrip(".")
 
-
 def _is_private_ip(ip: str) -> bool:
     try:
         return ipaddress.ip_address(ip).is_private
     except ValueError:
         return False
-
 
 def _classify_from_description(description: str, interface_type: str):
     """Map an ENI description/interface type to (resource_type, workload_hint)."""
@@ -139,7 +134,6 @@ def _classify_from_description(description: str, interface_type: str):
         workload = desc
     return rtype, workload
 
-
 class InfraResolver:
     def __init__(self, session: Optional[boto3.Session] = None,
                  aggregator_name: str = DEFAULT_AGGREGATOR,
@@ -171,10 +165,7 @@ class InfraResolver:
     # ---- Config-driven hosted-zone discovery ------------------------------
     def _load_zone_inventory(self) -> list:
         """Enumerate ALL Route53 hosted zones org-wide via the Config aggregator.
-
-        Returns a list of dicts: {accountId, zoneId, zoneName}.
-        Cached for the life of the resolver instance.
-        """
+        Returns a list of dicts: {accountId, zoneId, zoneName}. Cached."""
         if self._zone_inventory is not None:
             return self._zone_inventory
 
@@ -185,24 +176,19 @@ class InfraResolver:
         kwargs = dict(Expression=expr,
                       ConfigurationAggregatorName=self.aggregator_name,
                       Limit=100)
-        try:
-            while True:
-                resp = self.config.select_aggregate_resource_config(**kwargs)
-                for row in resp.get("Results", []):
-                    d = json.loads(row)
-                    zones.append({
-                        "accountId": d.get("accountId"),
-                        "zoneId": d.get("resourceId"),
-                        "zoneName": (d.get("resourceName") or "").rstrip("."),
-                    })
-                token = resp.get("NextToken")
-                if not token:
-                    break
-                kwargs["NextToken"] = token
-        except Exception as e:  # noqa: BLE001
-            # Leave inventory empty; caller will note the failure.
-            self._zone_inventory = []
-            raise e
+        while True:
+            resp = self.config.select_aggregate_resource_config(**kwargs)
+            for row in resp.get("Results", []):
+                d = json.loads(row)
+                zones.append({
+                    "accountId": d.get("accountId"),
+                    "zoneId": d.get("resourceId"),
+                    "zoneName": (d.get("resourceName") or "").rstrip("."),
+                })
+            token = resp.get("NextToken")
+            if not token:
+                break
+            kwargs["NextToken"] = token
         self._zone_inventory = zones
         return zones
 
@@ -220,12 +206,25 @@ class InfraResolver:
         return candidates
 
     # ---- Cross-account Route53 client -------------------------------------
+    def _current_account_id(self) -> Optional[str]:
+        if not hasattr(self, "_caller_acct"):
+            try:
+                self._caller_acct = self.sts.get_caller_identity()["Account"]
+            except Exception:  # noqa: BLE001
+                self._caller_acct = None
+        return self._caller_acct
+
     def _route53_for_account(self, account_id: str):
-        """Return a Route53 client in the target account by assuming the role
-        there. Cached per account. On EC2 the instance profile must be permitted
-        to assume <assume_role_name> in each zone-owning account."""
+        """Return a Route53 client in the target account. If we're already
+        operating as that account, use the base session directly (no assume-role).
+        Otherwise assume <assume_role_name> in the target account. Cached."""
         if account_id in self._r53_clients:
             return self._r53_clients[account_id]
+
+        if account_id == self._current_account_id():
+            client = self.session.client("route53", region_name="us-east-1")
+            self._r53_clients[account_id] = client
+            return client
 
         role_arn = f"arn:aws:iam::{account_id}:role/{self.assume_role_name}"
         creds = self.sts.assume_role(
@@ -254,8 +253,7 @@ class InfraResolver:
 
         for rr in resp.get("ResourceRecordSets", []):
             # list_resource_record_sets returns records at/after the start name;
-            # filter to the EXACT hostname (learned from real data where nearby
-            # records leaked into the response).
+            # filter to the EXACT hostname (nearby records can leak into response).
             if rr.get("Name", "").rstrip(".") != hostname:
                 continue
             zr = ZoneRecord(
@@ -301,11 +299,13 @@ class InfraResolver:
                 "Hostname suffixes a known zone, but no exact record found in any "
                 "candidate zone (record may not exist or be in an unreadable account).")
 
-    def attribute_ip(self, ip: str) -> list:
+    # ---- Step 3: Config aggregator IP attribution -------------------------
+    def attribute_ip(self, ip: str, source: Optional[str] = None) -> list:
+        import json
         expr = (
             "SELECT accountId, awsRegion, resourceId, "
             "configuration.privateIpAddress, configuration.description, "
-            "configuration.interfaceType "
+            "configuration.interfaceType, configuration.attachment.instanceId "
             "WHERE resourceType = 'AWS::EC2::NetworkInterface' "
             f"AND configuration.privateIpAddress = '{ip}'"
         )
@@ -316,16 +316,21 @@ class InfraResolver:
                 Limit=25,
             )
         except Exception as e:  # noqa: BLE001
-            return [ResourceMatch(private_ip=ip, description=f"Config query error: {e}")]
+            return [ResourceMatch(private_ip=ip, description=f"Config query error: {e}",
+                                  source=source)]
 
-        import json
         matches = []
         for row in resp.get("Results", []):
             d = json.loads(row)
             cfg = d.get("configuration", {}) or {}
             desc = cfg.get("description")
             itype = cfg.get("interfaceType")
+            instance_id = (cfg.get("attachment") or {}).get("instanceId")
             rtype, workload = _classify_from_description(desc, itype)
+            # A plain instance ENI has no description/special type -> classify as EC2.
+            if rtype is None and instance_id:
+                rtype = "EC2 instance"
+                workload = instance_id
             matches.append(ResourceMatch(
                 account_id=d.get("accountId"),
                 region=d.get("awsRegion"),
@@ -335,31 +340,21 @@ class InfraResolver:
                 interface_type=itype,
                 resource_type=rtype,
                 workload_hint=workload,
+                attached_instance_id=instance_id,
+                source=source,
             ))
         return matches
 
     def attribute_alias_target(self, alias_dns: str) -> list:
-        """Attribute an ELB alias DNS name (e.g.
-        internal-kh-test-progress-123.us-west-2.elb.amazonaws.com) to an account
-        by resolving the ELB's ENIs via the Config aggregator.
-
-        Strategy: an ELB's ENIs carry a description containing the ELB name, so
-        we search ENIs whose description references the alias's ELB name.
-        """
-        # Extract the ELB name from the alias DNS.
-        #   internal-<name>-<hash>.<region>.elb.amazonaws.com  (ALB, internal)
-        #   <name>-<hash>.<region>.elb.amazonaws.com           (ALB)
-        #   <name>-<hash>.elb.<region>.amazonaws.com           (NLB)
+        """Attribute an ELB alias DNS name to an account by matching the ELB name
+        against ENI descriptions in the Config aggregator."""
+        import json
         first = alias_dns.split(".")[0]
         elb_name = first
         if elb_name.startswith("internal-"):
             elb_name = elb_name[len("internal-"):]
-        # Drop the trailing -<hash> segment.
         elb_name = re.sub(r"-[0-9a-f]{6,}$", "", elb_name)
 
-        import json
-        # ENI descriptions look like "ELB app/<name>/..." or "ELB net/<name>/..."
-        # Config LIKE can't lead with a wildcard, so anchor on "ELB ".
         expr = (
             "SELECT accountId, awsRegion, resourceId, "
             "configuration.privateIpAddress, configuration.description, "
@@ -390,6 +385,7 @@ class InfraResolver:
                             interface_type=cfg.get("interfaceType"),
                             resource_type=rtype,
                             workload_hint=workload,
+                            source="alias",
                         ))
                 token = resp.get("NextToken")
                 if not token:
@@ -397,9 +393,10 @@ class InfraResolver:
                 kwargs["NextToken"] = token
         except Exception as e:  # noqa: BLE001
             return [ResourceMatch(description=f"Alias attribution error: {e}",
-                                  workload_hint=elb_name)]
+                                  workload_hint=elb_name, source="alias")]
         return matches
 
+    # ---- Orchestration ----------------------------------------------------
     def resolve(self, url: str) -> ResolveResult:
         hostname = _hostname_from_url(url)
         result = ResolveResult(url=url, hostname=hostname)
@@ -426,28 +423,49 @@ class InfraResolver:
             if not _is_private_ip(ip):
                 result.notes.append(
                     f"{ip} is public/AWS-managed (e.g. API Gateway/CloudFront) -- "
-                    f"using Route53 alias target for attribution instead.")
+                    f"using Route53 record for attribution instead.")
                 continue
-            for m in self.attribute_ip(ip):
+            for m in self.attribute_ip(ip, source="dns-ip"):
                 _add(m)
+
+        # Step 3a-bis: attribute IPs taken directly from A-record values
+        # (plain A records with no alias; critical when live DNS is unavailable).
+        for zr in result.zone_records:
+            for ip in zr.get("values", []) or []:
+                if not _is_private_ip(ip):
+                    result.notes.append(
+                        f"{ip} (A record value) is not a private IP -- skipping ENI attribution.")
+                    continue
+                for m in self.attribute_ip(ip, source="a-record-ip"):
+                    _add(m)
 
         # Step 3b: attribute via alias targets from the Route53 records (the more
         # precise path -- names the ELB directly, no DNS needed).
         for zr in result.zone_records:
             alias = zr.get("alias_target")
             if alias and "elb.amazonaws.com" in alias:
-                for m in self.attribute_alias_target(alias):
-                    _add(m)
+                alias_matches = self.attribute_alias_target(alias)
+                if alias_matches:
+                    for m in alias_matches:
+                        _add(m)
+                else:
+                    result.notes.append(
+                        f"Record aliases to '{alias}' but no backing ENI/resource was "
+                        f"found in Config -- the target may be a deleted/stale ELB or "
+                        f"in a region outside the aggregator.")
 
         if not result.matches and not result.zone_records:
             result.notes.append(
                 "No ENI match and no Route53 record. Target may be an AWS-managed "
                 "endpoint (API Gateway/CloudFront), in a region outside the "
                 "'us-regions' aggregator, or not yet recorded by Config.")
+        elif not result.matches and result.zone_records:
+            result.notes.append(
+                "Found a Route53 record but could not attribute it to a resource "
+                "(see record values/alias above).")
 
         result.matches = [asdict(m) for m in result.matches]
         return result
-
 
 if __name__ == "__main__":
     import sys
@@ -467,7 +485,7 @@ if __name__ == "__main__":
         profile = sys.argv[3] if len(sys.argv) > 3 else None
         sess = boto3.Session(profile_name=profile) if profile else None
         r = InfraResolver(session=sess)
-        matches = [asdict(m) for m in r.attribute_ip(ip)]
+        matches = [asdict(m) for m in r.attribute_ip(ip, source="manual")]
         print(json.dumps({"ip": ip, "matches": matches}, indent=2, default=str))
     else:
         url = sys.argv[1]
