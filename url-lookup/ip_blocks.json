@@ -1,0 +1,11 @@
+{
+  "_comment": "CIDR -> location map for the URL resolver (tiers 4/5 fallback, used only when no AWS ENI/subnet/VPC match is found). Update freely, no code change needed. Most-specific match wins.",
+  "blocks": [
+    { "cidr": "172.22.0.0/16",    "location": "PDC" },
+    { "cidr": "172.26.0.0/16",    "location": "PDC" },
+    { "cidr": "172.29.0.0/16",    "location": "PDC" },
+    { "cidr": "192.168.0.0/16",   "location": "PDC" },
+    { "cidr": "206.218.0.0/18",   "location": "CSAA Public IP Space" },
+    { "cidr": "209.134.192.0/18", "location": "CSAA PDC DMZ IP Space" }
+  ]
+}
