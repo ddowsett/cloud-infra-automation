@@ -5,7 +5,7 @@ Resolution ladder (per resolved IP, stop at first tier that answers):
   1. Exact ENI match (Config AWS::EC2::NetworkInterface by private IP)
        -> account + resource + region
   2. Containing subnet (Config AWS::EC2::Subnet whose CIDR contains the IP)
-       -> account + region + VPC + subnet + AZ   (source: subnet-cidr)
+       -> account + region + VPC + subnet   (source: subnet-cidr)
   3. Containing VPC (Config AWS::EC2::VPC whose CIDR contains the IP)
        -> account + region + VPC                 (source: vpc-cidr)
   4. CSAA CIDR list (ip_blocks.json)              -> network location label
@@ -60,7 +60,6 @@ class ResourceMatch:
     attached_instance_id: Optional[str] = None
     vpc_id: Optional[str] = None
     subnet_id: Optional[str] = None
-    availability_zone: Optional[str] = None
     source: Optional[str] = None
 
 
@@ -246,7 +245,7 @@ class InfraResolver:
             return self._subnet_inventory
         rows = self._select_all(
             "SELECT accountId, awsRegion, resourceId, configuration.cidrBlock, "
-            "configuration.vpcId, configuration.availabilityZone "
+            "configuration.vpcId "
             "WHERE resourceType = 'AWS::EC2::Subnet'")
         subs = []
         for row in rows:
@@ -261,7 +260,7 @@ class InfraResolver:
                 continue
             subs.append({"net": net, "accountId": d.get("accountId"),
                          "region": d.get("awsRegion"), "subnetId": d.get("resourceId"),
-                         "vpcId": c.get("vpcId"), "az": c.get("availabilityZone")})
+                         "vpcId": c.get("vpcId")})
         self._subnet_inventory = subs
         return subs
 
@@ -420,8 +419,7 @@ class InfraResolver:
                 resource_id=best["subnetId"], private_ip=ip,
                 resource_type="Subnet (no ENI for exact IP)",
                 workload_hint=f"in {best['vpcId']}", vpc_id=best["vpcId"],
-                subnet_id=best["subnetId"], availability_zone=best["az"],
-                source="subnet-cidr")
+                subnet_id=best["subnetId"], source="subnet-cidr")
         # Tier 3: containing VPC.
         bestv = None
         for v in self._load_vpc_inventory():
