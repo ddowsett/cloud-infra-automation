@@ -1,0 +1,11 @@
+{
+  "_comment": "AWS accounts excluded from the URL resolver. Zones, ENIs, subnets, VPCs, and CloudFront distributions in these accounts are ignored (not used for discovery or attribution). Update freely, no code change needed.",
+  "excluded_accounts": [
+    { "account_id": "871752693029", "name": "Apps Sandbox" },
+    { "account_id": "705664266673", "name": "EDH Sandbox" },
+    { "account_id": "160534020129", "name": "ITOps-Sandbox" },
+    { "account_id": "930808770436", "name": "Apps NG Sandbox" },
+    { "account_id": "277847035049", "name": "SecuritySandbox" },
+    { "account_id": "981731622504", "name": "cto-sandbox-prodalz" }
+  ]
+}

@@ -46,6 +46,24 @@ IP_BLOCKS_FILE = os.environ.get(
     "RESOLVER_IP_BLOCKS",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "ip_blocks.json"))
 
+# Accounts excluded from discovery/attribution (e.g. sandbox). Sits next to this file.
+EXCLUDED_ACCOUNTS_FILE = os.environ.get(
+    "RESOLVER_EXCLUDED_ACCOUNTS",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "excluded_accounts.json"))
+
+
+def _load_excluded_accounts():
+    try:
+        with open(EXCLUDED_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {e["account_id"] for e in data.get("excluded_accounts", []) if e.get("account_id")}
+    except Exception:  # noqa: BLE001 - missing file = exclude nothing
+        return set()
+
+
+# Module-level set of excluded account IDs.
+EXCLUDED_ACCOUNTS = _load_excluded_accounts()
+
 
 @dataclass
 class ResourceMatch:
@@ -235,6 +253,8 @@ class InfraResolver:
         zones = []
         for row in rows:
             d = json.loads(row)
+            if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                continue
             zones.append({"accountId": d.get("accountId"), "zoneId": d.get("resourceId"),
                           "zoneName": (d.get("resourceName") or "").rstrip(".")})
         self._zone_inventory = zones
@@ -250,6 +270,8 @@ class InfraResolver:
         subs = []
         for row in rows:
             d = json.loads(row)
+            if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                continue
             c = d.get("configuration", {}) or {}
             cidr = c.get("cidrBlock")
             if not cidr:
@@ -273,6 +295,8 @@ class InfraResolver:
         vpcs = []
         for row in rows:
             d = json.loads(row)
+            if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                continue
             c = d.get("configuration", {}) or {}
             cidr = c.get("cidrBlock")
             if not cidr:
@@ -384,6 +408,8 @@ class InfraResolver:
         matches = []
         for row in resp.get("Results", []):
             d = json.loads(row)
+            if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                continue
             cfg = d.get("configuration", {}) or {}
             desc = cfg.get("description")
             itype = cfg.get("interfaceType")
@@ -449,6 +475,8 @@ class InfraResolver:
             return [ResourceMatch(description=f"CloudFront query error: {e}", source=source)]
         for row in resp.get("Results", []):
             d = json.loads(row)
+            if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                continue
             cfg = d.get("configuration", {}) or {}
             matches.append(ResourceMatch(
                 account_id=d.get("accountId"), region="global", resource_id=d.get("resourceId"),
@@ -478,6 +506,8 @@ class InfraResolver:
                 resp = self.config.select_aggregate_resource_config(**kwargs)
                 for row in resp.get("Results", []):
                     d = json.loads(row)
+                    if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                        continue
                     cfg = d.get("configuration", {}) or {}
                     desc = cfg.get("description") or ""
                     if elb_name and elb_name in desc:
