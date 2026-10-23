@@ -110,6 +110,8 @@ INDEX_HTML = """<!doctype html>
     th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eee; font-size: .92rem; vertical-align: top; }
     th { width: 200px; color: #555; }
     .muted { color: #777; }
+    .err { color: #c5221f; }
+    code { background:#f6f8fa; padding:.05rem .3rem; border-radius:3px; font-size:.85rem; }
     pre { background: #f6f8fa; padding: .8rem; border-radius: 6px; overflow: auto; max-width: 980px; }
     .tag { display:inline-block; background:#eef3fd; color:#1662d4; border-radius: 4px; padding: .05rem .4rem; margin:.1rem; font-size:.85rem;}
   </style>
@@ -160,6 +162,35 @@ INDEX_HTML = """<!doctype html>
             `<span class=muted>account ${esc(m.account_id)} · ${esc(m.region)} · ${esc(m.resource_id)}` +
             (m.private_ip? ' · '+esc(m.private_ip):'') + `</span></div>`).join('<br/>') +
           `</td></tr>`;
+      }
+      if (d.ip_locations && d.ip_locations.length) {
+        rows += `<tr><th>Network location</th><td>` +
+          d.ip_locations.map(l => `<div><b>${esc(l.location)}</b>` +
+            (l.ip ? ` <span class=muted>(${esc(l.ip)}${l.cidr ? ', '+esc(l.cidr) : ''})</span>` : '') +
+            `</div>`).join('') +
+          `</td></tr>`;
+      }
+      if (d.trace && d.trace.length) {
+        let t = '';
+        d.trace.forEach(tr => {
+          t += `<div style="margin-bottom:.6rem">`;
+          t += `<b>${esc(tr.load_balancer)}</b> <span class=muted>(account ${esc(tr.lb_account)} · ${esc(tr.lb_region)})</span>`;
+          (tr.steps || []).forEach(s => {
+            if (s.error) { t += `<div class=err style="margin-left:1rem">${esc(s.step)}: ${esc(s.error)}</div>`; return; }
+            t += `<div style="margin-left:1rem">&rarr; target group <b>${esc(s.name)}</b> ` +
+                 `<span class=muted>(${esc(s.target_type)} ${esc(s.protocol)}:${esc(s.port)})</span></div>`;
+            (s.targets || []).forEach(tg => {
+              t += `<div style="margin-left:2rem" class=muted>target ${esc(tg.target)} — ${esc(tg.health)}</div>`;
+            });
+            (s.destinations || []).forEach(dest => {
+              t += `<div style="margin-left:2rem">&rarr; via <code>${esc(dest.via_vpc_endpoint)}</code>` +
+                   (dest.service ? ` <span class=muted>(${esc(dest.service)})</span>` : '') + `</div>`;
+              if (dest.terminus) t += `<div style="margin-left:3rem"><span class="tag">${esc(dest.terminus)}</span></div>`;
+            });
+          });
+          t += `</div>`;
+        });
+        rows += `<tr><th>Traffic path (deep trace)</th><td>${t}</td></tr>`;
       }
       if (d.notes && d.notes.length) rows += `<tr><th>Notes</th><td class=muted>${d.notes.map(esc).join('<br/>')}</td></tr>`;
       rows += `<tr><th>Audit lookup id</th><td class=muted>${esc(d.lookup_id)}</td></tr>`;
