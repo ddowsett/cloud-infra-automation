@@ -42,6 +42,21 @@ AKAMAI_SUFFIXES = ("edgekey.net", "akamaiedge.net", "edgesuite.net")
 CLOUDFRONT_SUFFIX = "cloudfront.net"
 
 
+def _classify_endpoint_service(service_name: str) -> str:
+    """Human label for a VPC endpoint's service -- the real terminus of an
+    ELB -> VPC-endpoint PrivateLink path."""
+    s = (service_name or "").lower()
+    if s.endswith(".execute-api"):
+        return "Private API Gateway (execute-api via PrivateLink)"
+    if ".vpce-svc-" in s or "vpce-svc-" in s:
+        return "Cross-account PrivateLink endpoint service (provider owns the backend)"
+    if s.startswith("com.amazonaws."):
+        # e.g. com.amazonaws.us-west-2.s3 / .dynamodb / .elasticloadbalancing
+        svc = s.rsplit(".", 1)[-1]
+        return f"AWS service endpoint ({svc})"
+    return f"VPC endpoint service: {service_name}"
+
+
 def _is_elb_dns(name: str) -> bool:
     """True for either ELB DNS format:
        ALB: <name>-<hash>.<region>.elb.amazonaws.com
@@ -119,6 +134,7 @@ class ResolveResult:
     split_horizon: bool = False
     matches: list = field(default_factory=list)
     ip_locations: list = field(default_factory=list)
+    trace: list = field(default_factory=list)   # deeper hop chain for ELB-fronted targets
     notes: list = field(default_factory=list)
 
     def to_dict(self):
@@ -339,21 +355,39 @@ class InfraResolver:
                 self._caller_acct = None
         return self._caller_acct
 
-    def _route53_for_account(self, account_id: str):
-        if account_id in self._r53_clients:
-            return self._r53_clients[account_id]
+    def _creds_for_account(self, account_id: str):
+        """Return credentials kwargs for a client in the target account.
+        Empty dict if we're already that account (use base session)."""
         if account_id == self._current_account_id():
-            client = self.session.client("route53", region_name="us-east-1")
-            self._r53_clients[account_id] = client
-            return client
-        role_arn = f"arn:aws:iam::{account_id}:role/{self.assume_role_name}"
-        creds = self.sts.assume_role(RoleArn=role_arn, RoleSessionName="url-infra-resolver")["Credentials"]
-        client = boto3.client("route53", region_name="us-east-1",
-                              aws_access_key_id=creds["AccessKeyId"],
-                              aws_secret_access_key=creds["SecretAccessKey"],
-                              aws_session_token=creds["SessionToken"])
-        self._r53_clients[account_id] = client
-        return client
+            return {}
+        if not hasattr(self, "_creds_cache"):
+            self._creds_cache = {}
+        if account_id not in self._creds_cache:
+            role_arn = f"arn:aws:iam::{account_id}:role/{self.assume_role_name}"
+            c = self.sts.assume_role(RoleArn=role_arn,
+                                     RoleSessionName="url-infra-resolver")["Credentials"]
+            self._creds_cache[account_id] = {
+                "aws_access_key_id": c["AccessKeyId"],
+                "aws_secret_access_key": c["SecretAccessKey"],
+                "aws_session_token": c["SessionToken"],
+            }
+        return self._creds_cache[account_id]
+
+    def _client_for_account(self, service: str, account_id: str, region: str):
+        """Generic cross-account client (assumes the spoke role as needed)."""
+        key = (service, account_id, region)
+        if not hasattr(self, "_svc_clients"):
+            self._svc_clients = {}
+        if key not in self._svc_clients:
+            creds = self._creds_for_account(account_id)
+            if creds:
+                self._svc_clients[key] = boto3.client(service, region_name=region, **creds)
+            else:
+                self._svc_clients[key] = self.session.client(service, region_name=region)
+        return self._svc_clients[key]
+
+    def _route53_for_account(self, account_id: str):
+        return self._client_for_account("route53", account_id, "us-east-1")
 
     def lookup_record_in_zone(self, zone: dict, hostname: str) -> Optional[ZoneRecord]:
         try:
@@ -505,8 +539,9 @@ class InfraResolver:
         AWS::ElasticLoadBalancingV2::LoadBalancer dNSName attribute. Precise:
         one DNS name -> one LB -> one account (no ENI fan-out / name lookalikes)."""
         target = (alias_dns or "").rstrip(".")
-        expr = ("SELECT accountId, awsRegion, resourceId, resourceName, "
-                "configuration.type, configuration.scheme, configuration.dNSName "
+        expr = ("SELECT accountId, awsRegion, resourceId, resourceName, arn, "
+                "configuration.type, configuration.scheme, configuration.dNSName, "
+                "configuration.loadBalancerArn "
                 "WHERE resourceType = 'AWS::ElasticLoadBalancingV2::LoadBalancer' "
                 f"AND configuration.dNSName = '{target}'")
         matches = []
@@ -522,16 +557,104 @@ class InfraResolver:
                 rtype = {"network": "NLB", "application": "ALB", "gateway": "GWLB"}.get(
                     lb_type, "Load Balancer")
                 scheme = c.get("scheme")
-                matches.append(ResourceMatch(
+                m = ResourceMatch(
                     account_id=d.get("accountId"), region=d.get("awsRegion"),
                     resource_id=d.get("resourceName") or d.get("resourceId"),
                     resource_type=rtype,
                     workload_hint=f"{d.get('resourceName')} ({scheme})" if scheme else d.get("resourceName"),
-                    description=c.get("dNSName"), source="alias-elb-dns"))
+                    description=c.get("dNSName"), source="alias-elb-dns")
+                # Stash the LB ARN for the deep-trace (not serialized on the match).
+                m._lb_arn = c.get("loadBalancerArn") or d.get("arn")
+                matches.append(m)
         except Exception as e:  # noqa: BLE001
             return [ResourceMatch(description=f"ELB alias lookup error: {e}",
                                   workload_hint=target, source="alias-elb-dns")]
         return matches
+
+    # ---- Deep trace: ELB -> target groups -> targets -> VPC endpoint ------
+    def trace_elb_targets(self, lb_arn: str, account_id: str, region: str) -> list:
+        """Live cross-account trace of an ELB's forwarding path:
+        listeners -> target groups -> registered targets. For IP targets that are
+        VPC-endpoint ENIs, resolve the endpoint + its service (e.g. execute-api =
+        private API Gateway). Requires elasticloadbalancing:Describe* and
+        ec2:DescribeNetworkInterfaces/DescribeVpcEndpoints on the spoke role.
+        Returns a list of human-readable trace step dicts."""
+        steps = []
+        try:
+            elb = self._client_for_account("elbv2", account_id, region)
+            ec2 = self._client_for_account("ec2", account_id, region)
+        except Exception as e:  # noqa: BLE001
+            return [{"step": "trace-init", "error": str(e)}]
+
+        tg_arns = set()
+        try:
+            for tg in elb.describe_target_groups(LoadBalancerArn=lb_arn).get("TargetGroups", []):
+                tg_arns.add((tg["TargetGroupArn"], tg.get("TargetGroupName"),
+                             tg.get("TargetType"), tg.get("Protocol"), tg.get("Port")))
+        except Exception as e:  # noqa: BLE001
+            return [{"step": "describe-target-groups", "error": str(e)}]
+
+        for tg_arn, tg_name, tg_type, proto, port in tg_arns:
+            step = {"step": "target-group", "name": tg_name, "target_type": tg_type,
+                    "protocol": proto, "port": port, "targets": []}
+            try:
+                health = elb.describe_target_health(
+                    TargetGroupArn=tg_arn).get("TargetHealthDescriptions", [])
+            except Exception as e:  # noqa: BLE001
+                step["error"] = str(e)
+                steps.append(step)
+                continue
+            # Collect IP targets so we can look them up in one ENI call.
+            ip_targets = []
+            for h in health:
+                tid = h.get("Target", {}).get("Id")
+                state = h.get("TargetHealth", {}).get("State")
+                t = {"target": tid, "health": state}
+                try:
+                    ipaddress.ip_address(tid)
+                    ip_targets.append(tid)
+                except ValueError:
+                    pass
+                step["targets"].append(t)
+            # Resolve IP targets -> ENIs -> VPC endpoint + service.
+            if ip_targets:
+                self._enrich_ip_targets(ec2, ip_targets, step)
+            steps.append(step)
+        return steps
+
+    def _enrich_ip_targets(self, ec2, ips: list, step: dict) -> None:
+        try:
+            enis = ec2.describe_network_interfaces(
+                Filters=[{"Name": "addresses.private-ip-address", "Values": ips}]
+            ).get("NetworkInterfaces", [])
+        except Exception as e:  # noqa: BLE001
+            step["target_eni_error"] = str(e)
+            return
+        endpoints = {}  # vpce-id -> set of ips
+        for e in enis:
+            itype = e.get("InterfaceType")
+            desc = e.get("Description", "") or ""
+            ip = None
+            for a in e.get("PrivateIpAddresses", []):
+                if a.get("PrivateIpAddress") in ips:
+                    ip = a["PrivateIpAddress"]
+                    break
+            if itype == "vpc_endpoint" or "vpce-" in desc:
+                m = re.search(r"(vpce-[0-9a-f]+)", desc)
+                vpce = m.group(1) if m else "vpce-?"
+                endpoints.setdefault(vpce, set()).add(ip)
+        for vpce, ipset in endpoints.items():
+            dest = {"via_vpc_endpoint": vpce, "target_ips": sorted(i for i in ipset if i)}
+            # Describe the endpoint to get its service (the real terminus).
+            try:
+                ve = ec2.describe_vpc_endpoints(VpcEndpointIds=[vpce]).get("VpcEndpoints", [])
+                if ve:
+                    svc = ve[0].get("ServiceName", "")
+                    dest["service"] = svc
+                    dest["terminus"] = _classify_endpoint_service(svc)
+            except Exception as e:  # noqa: BLE001
+                dest["endpoint_error"] = str(e)
+            step.setdefault("destinations", []).append(dest)
 
     # ---- Per-IP attribution: tier 1 -> 2/3 -> 4/5 -------------------------
     def attribute_ip(self, ip: str, result: ResolveResult, seen: set, source_tag: str) -> None:
@@ -628,6 +751,21 @@ class InfraResolver:
                 if elbm:
                     for m in elbm:
                         self._add_match(result, seen, m)
+                        # Automatic deep-trace: follow the LB's forwarding path
+                        # (target groups -> targets -> VPC endpoint/service).
+                        lb_arn = getattr(m, "_lb_arn", None)
+                        if lb_arn and m.account_id and m.region:
+                            try:
+                                chain = self.trace_elb_targets(lb_arn, m.account_id, m.region)
+                                if chain:
+                                    result.trace.append({
+                                        "load_balancer": m.resource_id,
+                                        "lb_account": m.account_id,
+                                        "lb_region": m.region,
+                                        "steps": chain,
+                                    })
+                            except Exception as e:  # noqa: BLE001
+                                result.notes.append(f"Deep-trace of {m.resource_id} failed: {e}")
                 else:
                     result.notes.append(
                         f"Record aliases to '{alias}' but no backing ENI found (stale ELB?).")
