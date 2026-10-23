@@ -41,6 +41,15 @@ ASSUME_ROLE_NAME = os.environ.get("RESOLVER_ASSUME_ROLE", "CsaaInfraResolverRead
 AKAMAI_SUFFIXES = ("edgekey.net", "akamaiedge.net", "edgesuite.net")
 CLOUDFRONT_SUFFIX = "cloudfront.net"
 
+
+def _is_elb_dns(name: str) -> bool:
+    """True for either ELB DNS format:
+       ALB: <name>-<hash>.<region>.elb.amazonaws.com
+       NLB: <name>-<hash>.elb.<region>.amazonaws.com
+    Both contain '.elb.' and end in '.amazonaws.com'."""
+    n = (name or "").rstrip(".").lower()
+    return ".elb." in n and n.endswith(".amazonaws.com")
+
 # Path to the CSAA CIDR -> location map (tiers 4/5 fallback). Sits next to this file.
 IP_BLOCKS_FILE = os.environ.get(
     "RESOLVER_IP_BLOCKS",
@@ -616,7 +625,7 @@ class InfraResolver:
                 else:
                     result.notes.append(
                         f"Record aliases to CloudFront '{alias}' but no matching distribution found.")
-            elif "elb.amazonaws.com" in alias:
+            elif _is_elb_dns(alias):
                 elbm = self.attribute_alias_target(alias)
                 if elbm:
                     for m in elbm:
@@ -660,7 +669,7 @@ class InfraResolver:
                     if m.account_id:
                         m.source = "akamai-origin-cloudfront"
                         self._add_match(result, seen, m)
-            elif "elb.amazonaws.com" in alias:
+            elif _is_elb_dns(alias):
                 for m in self.attribute_alias_target(alias):
                     m.source = "akamai-origin-elb"
                     self._add_match(result, seen, m)
