@@ -501,38 +501,36 @@ class InfraResolver:
         return self._cf_match(f"configuration.domainName = '{cf_domain}'", "cloudfront-domain")
 
     def attribute_alias_target(self, alias_dns: str) -> list:
-        first = alias_dns.split(".")[0]
-        elb_name = first[len("internal-"):] if first.startswith("internal-") else first
-        elb_name = re.sub(r"-[0-9a-f]{6,}$", "", elb_name)
-        expr = ("SELECT accountId, awsRegion, resourceId, configuration.privateIpAddress, "
-                "configuration.description, configuration.interfaceType "
-                "WHERE resourceType = 'AWS::EC2::NetworkInterface' "
-                "AND configuration.description LIKE 'ELB %'")
+        """Map an ELB alias DNS name to exactly one load balancer via Config's
+        AWS::ElasticLoadBalancingV2::LoadBalancer dNSName attribute. Precise:
+        one DNS name -> one LB -> one account (no ENI fan-out / name lookalikes)."""
+        target = (alias_dns or "").rstrip(".")
+        expr = ("SELECT accountId, awsRegion, resourceId, resourceName, "
+                "configuration.type, configuration.scheme, configuration.dNSName "
+                "WHERE resourceType = 'AWS::ElasticLoadBalancingV2::LoadBalancer' "
+                f"AND configuration.dNSName = '{target}'")
         matches = []
         try:
-            kwargs = dict(Expression=expr, ConfigurationAggregatorName=self.aggregator_name, Limit=100)
-            while True:
-                resp = self.config.select_aggregate_resource_config(**kwargs)
-                for row in resp.get("Results", []):
-                    d = json.loads(row)
-                    if d.get("accountId") in EXCLUDED_ACCOUNTS:
-                        continue
-                    cfg = d.get("configuration", {}) or {}
-                    desc = cfg.get("description") or ""
-                    if elb_name and elb_name in desc:
-                        rtype, workload = _classify_from_description(desc, cfg.get("interfaceType"))
-                        matches.append(ResourceMatch(
-                            account_id=d.get("accountId"), region=d.get("awsRegion"),
-                            resource_id=d.get("resourceId"), private_ip=cfg.get("privateIpAddress"),
-                            description=desc, interface_type=cfg.get("interfaceType"),
-                            resource_type=rtype, workload_hint=workload, source="alias"))
-                token = resp.get("NextToken")
-                if not token:
-                    break
-                kwargs["NextToken"] = token
+            resp = self.config.select_aggregate_resource_config(
+                Expression=expr, ConfigurationAggregatorName=self.aggregator_name, Limit=10)
+            for row in resp.get("Results", []):
+                d = json.loads(row)
+                if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                    continue
+                c = d.get("configuration", {}) or {}
+                lb_type = (c.get("type") or "").lower()
+                rtype = {"network": "NLB", "application": "ALB", "gateway": "GWLB"}.get(
+                    lb_type, "Load Balancer")
+                scheme = c.get("scheme")
+                matches.append(ResourceMatch(
+                    account_id=d.get("accountId"), region=d.get("awsRegion"),
+                    resource_id=d.get("resourceName") or d.get("resourceId"),
+                    resource_type=rtype,
+                    workload_hint=f"{d.get('resourceName')} ({scheme})" if scheme else d.get("resourceName"),
+                    description=c.get("dNSName"), source="alias-elb-dns"))
         except Exception as e:  # noqa: BLE001
-            return [ResourceMatch(description=f"Alias attribution error: {e}",
-                                  workload_hint=elb_name, source="alias")]
+            return [ResourceMatch(description=f"ELB alias lookup error: {e}",
+                                  workload_hint=target, source="alias-elb-dns")]
         return matches
 
     # ---- Per-IP attribution: tier 1 -> 2/3 -> 4/5 -------------------------
