@@ -355,35 +355,49 @@ class InfraResolver:
                 self._caller_acct = None
         return self._caller_acct
 
-    def _creds_for_account(self, account_id: str):
-        """Return credentials kwargs for a client in the target account.
-        Empty dict if we're already that account (use base session)."""
+    def _session_for_account(self, account_id: str):
+        """Return a boto3 Session for the target account backed by AUTO-REFRESHING
+        assumed-role credentials. Re-assumes the role automatically before expiry,
+        so a long-running process never serves expired creds (the cause of the
+        'works for an hour then stops' bug). If the account is our own, returns
+        the base session."""
         if account_id == self._current_account_id():
-            return {}
-        if not hasattr(self, "_creds_cache"):
-            self._creds_cache = {}
-        if account_id not in self._creds_cache:
+            return self.session
+        if not hasattr(self, "_account_sessions"):
+            self._account_sessions = {}
+        if account_id not in self._account_sessions:
+            from botocore.credentials import (
+                DeferredRefreshableCredentials, create_assume_role_refresher)
+            from botocore.session import get_session as _get_botocore_session
+
             role_arn = f"arn:aws:iam::{account_id}:role/{self.assume_role_name}"
-            c = self.sts.assume_role(RoleArn=role_arn,
-                                     RoleSessionName="url-infra-resolver")["Credentials"]
-            self._creds_cache[account_id] = {
-                "aws_access_key_id": c["AccessKeyId"],
-                "aws_secret_access_key": c["SecretAccessKey"],
-                "aws_session_token": c["SessionToken"],
-            }
-        return self._creds_cache[account_id]
+
+            def _refresh():
+                c = self.sts.assume_role(
+                    RoleArn=role_arn, RoleSessionName="url-infra-resolver")["Credentials"]
+                return {
+                    "access_key": c["AccessKeyId"],
+                    "secret_key": c["SecretAccessKey"],
+                    "token": c["SessionToken"],
+                    "expiry_time": c["Expiration"].isoformat(),
+                }
+
+            refreshable = DeferredRefreshableCredentials(
+                refresh_using=_refresh, method="sts-assume-role")
+            botocore_sess = _get_botocore_session()
+            botocore_sess._credentials = refreshable
+            self._account_sessions[account_id] = boto3.Session(botocore_session=botocore_sess)
+        return self._account_sessions[account_id]
 
     def _client_for_account(self, service: str, account_id: str, region: str):
-        """Generic cross-account client (assumes the spoke role as needed)."""
+        """Cross-account client built on an auto-refreshing session. Caching the
+        client is safe because the underlying credentials refresh themselves."""
         key = (service, account_id, region)
         if not hasattr(self, "_svc_clients"):
             self._svc_clients = {}
         if key not in self._svc_clients:
-            creds = self._creds_for_account(account_id)
-            if creds:
-                self._svc_clients[key] = boto3.client(service, region_name=region, **creds)
-            else:
-                self._svc_clients[key] = self.session.client(service, region_name=region)
+            sess = self._session_for_account(account_id)
+            self._svc_clients[key] = sess.client(service, region_name=region)
         return self._svc_clients[key]
 
     def _route53_for_account(self, account_id: str):
