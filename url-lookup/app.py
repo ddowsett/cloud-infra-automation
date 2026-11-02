@@ -119,6 +119,8 @@ INDEX_HTML = """<!doctype html>
     .match .title { margin-bottom:.35rem; }
     .match .attr { display:block; line-height:1.5; }
     .match .attr .lbl { color:#555; display:inline-block; min-width:120px; }
+    .hop { display:inline-block; min-width:1.3rem; height:1.3rem; line-height:1.3rem; text-align:center;
+           background:#1662d4; color:#fff; border-radius:50%; font-size:.78rem; font-weight:600; margin-right:.4rem; }
   </style>
 </head>
 <body>
@@ -170,28 +172,30 @@ INDEX_HTML = """<!doctype html>
       if (d.trace && d.trace.length) {
         let t = '';
         d.trace.forEach(tr => {
+          let hop = 0;
+          const num = () => `<span class=hop>${++hop}</span>`;
           t += `<div style="margin-bottom:.6rem">`;
-          t += `<b>${esc(tr.load_balancer)}</b> <span class=muted>(account ${esc(tr.lb_account)} · ${esc(tr.lb_region)})</span>`;
+          t += `${num()}<b>${esc(tr.load_balancer)}</b> <span class=muted>(account ${esc(tr.lb_account)} · ${esc(tr.lb_region)})</span>`;
           (tr.steps || []).forEach(s => {
             if (s.error) { t += `<div class=err style="margin-left:1rem">${esc(s.step)}: ${esc(s.error)}</div>`; return; }
-            t += `<div style="margin-left:1rem;margin-top:.6rem">&rarr; target group <b>${esc(s.name)}</b> ` +
+            t += `<div style="margin-left:1rem;margin-top:.6rem">${num()}target group <b>${esc(s.name)}</b> ` +
                  `<span class=muted>(${esc(s.target_type)} ${esc(s.protocol)}:${esc(s.port)})</span></div>`;
             (s.targets || []).forEach(tg => {
-              t += `<div style="margin-left:2rem" class=muted>target ${esc(tg.target)} — ${esc(tg.health)}</div>`;
+              t += `<div style="margin-left:2.7rem" class=muted>target ${esc(tg.target)} — ${esc(tg.health)}</div>`;
             });
             (s.destinations || []).forEach(dest => {
-              t += `<div style="margin-left:2rem;margin-top:.6rem">&rarr; via <code>${esc(dest.via_vpc_endpoint)}</code>` +
+              t += `<div style="margin-left:1rem;margin-top:.6rem">${num()}via <code>${esc(dest.via_vpc_endpoint)}</code>` +
                    (dest.service ? ` <span class=muted>(${esc(dest.service)})</span>` : '') + `</div>`;
               const er = dest.endpoint_resource;
               if (er) {
-                t += `<div style="margin-left:3rem;margin-top:.6rem"><span class="tag">${esc(er.resource_type)}</span> <b>${esc(er.name)}</b></div>`;
-                t += `<div style="margin-left:3rem" class=muted>` +
+                t += `<div style="margin-left:1rem;margin-top:.6rem">${num()}<span class="tag">${esc(er.resource_type)}</span> <b>${esc(er.name)}</b></div>`;
+                t += `<div style="margin-left:2.7rem" class=muted>` +
                      `account ${esc(er.account_id)} · ${esc(er.region)}` +
                      (er.owner_contact ? ` · owner ${esc(er.owner_contact)}` : '') +
                      (er.cost_center ? ` · cost-center ${esc(er.cost_center)}` : '') +
                      `</div>`;
               } else if (dest.terminus) {
-                t += `<div style="margin-left:3rem;margin-top:.6rem"><span class="tag">${esc(dest.terminus)}</span></div>`;
+                t += `<div style="margin-left:1rem;margin-top:.6rem">${num()}<span class="tag">${esc(dest.terminus)}</span></div>`;
               }
             });
           });
