@@ -114,6 +114,11 @@ INDEX_HTML = """<!doctype html>
     code { background:#f6f8fa; padding:.05rem .3rem; border-radius:3px; font-size:.85rem; }
     pre { background: #f6f8fa; padding: .8rem; border-radius: 6px; overflow: auto; max-width: 980px; }
     .tag { display:inline-block; background:#eef3fd; color:#1662d4; border-radius: 4px; padding: .05rem .4rem; margin:.1rem; font-size:.85rem;}
+    .match { padding:.5rem 0; }
+    .match + .match { border-top:1px solid #eee; margin-top:.5rem; }
+    .match .title { margin-bottom:.35rem; }
+    .match .attr { display:block; line-height:1.5; }
+    .match .attr .lbl { color:#555; display:inline-block; min-width:120px; }
   </style>
 </head>
 <body>
@@ -185,13 +190,19 @@ INDEX_HTML = """<!doctype html>
         rows += `<tr><th>Traffic path (deep trace)</th><td>${t}</td></tr>`;
       }
       if (d.matches && d.matches.length) {
+        const attr = (label, val) => (val==null || val==='') ? '' :
+          `<span class=attr><span class=lbl>${esc(label)}</span>${esc(val)}</span>`;
         rows += `<tr><th>Resource match(es)</th><td>` +
-          d.matches.map(m => `<div><span class="tag">${esc(m.resource_type||'?')}</span> ` +
-            `<b>${esc(m.workload_hint||m.resource_id||'')}</b><br/>` +
-            `<span class=muted>account ${esc(m.account_id)} · ${esc(m.region)} · ${esc(m.resource_id)}` +
-            (m.private_ip? ' · '+esc(m.private_ip):'') +
-            (m.owner_contact? ' · owner '+esc(m.owner_contact):'') +
-            (m.cost_center? ' · cost-center '+esc(m.cost_center):'') + `</span></div>`).join('<br/>') +
+          d.matches.map(m => `<div class=match>` +
+            `<div class=title><span class="tag">${esc(m.resource_type||'?')}</span> ` +
+            `<b>${esc(m.workload_hint||m.resource_id||'')}</b></div>` +
+            attr('AWS account:', m.account_id) +
+            attr('Region:', m.region) +
+            attr('Resource:', m.resource_id) +
+            attr('Private IP:', m.private_ip) +
+            attr('Owner:', m.owner_contact) +
+            attr('Cost center:', m.cost_center) +
+            `</div>`).join('') +
           `</td></tr>`;
       }
       if (d.notes && d.notes.length) rows += `<tr><th>Notes</th><td class=muted>${d.notes.map(esc).join('<br/>')}</td></tr>`;
