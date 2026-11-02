@@ -160,7 +160,9 @@ INDEX_HTML = """<!doctype html>
           d.matches.map(m => `<div><span class="tag">${esc(m.resource_type||'?')}</span> ` +
             `<b>${esc(m.workload_hint||m.resource_id||'')}</b><br/>` +
             `<span class=muted>account ${esc(m.account_id)} · ${esc(m.region)} · ${esc(m.resource_id)}` +
-            (m.private_ip? ' · '+esc(m.private_ip):'') + `</span></div>`).join('<br/>') +
+            (m.private_ip? ' · '+esc(m.private_ip):'') +
+            (m.owner_contact? ' · owner '+esc(m.owner_contact):'') +
+            (m.cost_center? ' · cost-center '+esc(m.cost_center):'') + `</span></div>`).join('<br/>') +
           `</td></tr>`;
       }
       if (d.ip_locations && d.ip_locations.length) {

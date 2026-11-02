@@ -68,6 +68,14 @@ def _is_elb_dns(name: str) -> bool:
     n = (name or "").rstrip(".").lower()
     return ".elb." in n and n.endswith(".amazonaws.com")
 
+
+def _is_apigw_regional_domain(name: str) -> bool:
+    """True for an API Gateway regional domain target, e.g.
+    d-6d754pmex2.execute-api.us-west-2.amazonaws.com -- a 'd-' prefixed name
+    whose label chain is .execute-api.<region>.amazonaws.com."""
+    n = (name or "").rstrip(".").lower()
+    return n.startswith("d-") and ".execute-api." in n and n.endswith(".amazonaws.com")
+
 # Path to the CSAA CIDR -> location map (tiers 4/5 fallback). Sits next to this file.
 IP_BLOCKS_FILE = os.environ.get(
     "RESOLVER_IP_BLOCKS",
@@ -106,6 +114,8 @@ class ResourceMatch:
     vpc_id: Optional[str] = None
     subnet_id: Optional[str] = None
     source: Optional[str] = None
+    owner_contact: Optional[str] = None
+    cost_center: Optional[str] = None
 
 
 @dataclass
@@ -597,6 +607,73 @@ class InfraResolver:
                                   workload_hint=target, source="alias-elb-dns")]
         return matches
 
+    # ---- API Gateway custom domain attribution (pure Config) --------------
+    def attribute_apigw_custom_domain(self, name: str) -> list:
+        """Map a hostname (or a regional execute-api 'd-xxxx....' target) to the
+        AWS::ApiGateway::DomainName resource in Config -- the custom domain lives
+        in the API's owning account, which may differ from the load balancer's.
+
+        Pure Config aggregator lookup (no live cross-account calls). Matches two
+        ways: by the custom domain name itself (resourceId == the hostname), and
+        by the regional domain target (configuration.RegionalDomainName == the
+        d-xxxx.execute-api.<region>.amazonaws.com name an alias points at).
+        Fails soft: logs a warning and returns [] on query error (caller may add
+        a note)."""
+        target = (name or "").rstrip(".")
+        if not target:
+            return []
+        expr = (
+            "SELECT accountId, awsRegion, resourceId, configuration.DomainName, "
+            "configuration.RegionalDomainName, configuration.Tags "
+            "WHERE resourceType = 'AWS::ApiGateway::DomainName' "
+            f"AND (resourceId = '{target}' "
+            f"OR configuration.RegionalDomainName = '{target}')"
+        )
+        matches = []
+        try:
+            resp = self.config.select_aggregate_resource_config(
+                Expression=expr, ConfigurationAggregatorName=self.aggregator_name, Limit=100)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("API Gateway custom-domain Config query failed for %s: %s: %s",
+                           target, type(e).__name__, e)
+            raise
+        for row in resp.get("Results", []):
+            d = json.loads(row)
+            if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                continue
+            cfg = d.get("configuration", {}) or {}
+            owner_contact = None
+            cost_center = None
+            for tag in (cfg.get("Tags") or []):
+                if not isinstance(tag, dict):
+                    continue
+                k = tag.get("Key")
+                v = tag.get("Value")
+                if k == "csaa:contact":
+                    owner_contact = v
+                elif k == "csaa:cost-center":
+                    cost_center = v
+            matches.append(ResourceMatch(
+                account_id=d.get("accountId"), region=d.get("awsRegion"),
+                resource_id=cfg.get("DomainName") or d.get("resourceId"),
+                resource_type="API Gateway (custom domain)",
+                workload_hint=cfg.get("RegionalDomainName"),
+                owner_contact=owner_contact, cost_center=cost_center,
+                source="apigw-custom-domain"))
+        return matches
+
+    def _add_apigw_matches(self, name: str, result: ResolveResult, seen: set) -> None:
+        """Run the pure-Config API Gateway custom-domain lookup for `name` and add
+        any matches. Fails soft: on Config error, append a note instead of raising
+        (the warning is already logged inside attribute_apigw_custom_domain)."""
+        try:
+            for m in self.attribute_apigw_custom_domain(name):
+                self._add_match(result, seen, m)
+        except Exception as e:  # noqa: BLE001
+            result.notes.append(
+                f"API Gateway custom-domain lookup for '{name}' failed: "
+                f"{type(e).__name__}: {e}")
+
     # ---- Deep trace: ELB -> target groups -> targets -> VPC endpoint ------
     def trace_elb_targets(self, lb_arn: str, account_id: str, region: str) -> list:
         """Live cross-account trace of an ELB's forwarding path:
@@ -760,9 +837,18 @@ class InfraResolver:
                         result.notes.append(
                             f"{val} (record value) is not an IP or known AWS/CDN target.")
 
+            # Direct alias to an API Gateway regional domain (d-xxxx.execute-api)
+            # -> attribute the custom domain (and its owning account) via Config.
+            for v in (zr.get("values", []) or []):
+                vv = (v or "").rstrip(".")
+                if _is_apigw_regional_domain(vv):
+                    self._add_apigw_matches(vv, result, seen)
+
             alias = (zr.get("alias_target") or "").rstrip(".")
             if not alias:
                 continue
+            if _is_apigw_regional_domain(alias):
+                self._add_apigw_matches(alias, result, seen)
             if alias.endswith(CLOUDFRONT_SUFFIX):
                 cf = self.attribute_cloudfront_by_domain(alias)
                 if any(m.account_id for m in cf):
@@ -795,6 +881,10 @@ class InfraResolver:
                 else:
                     result.notes.append(
                         f"Record aliases to '{alias}' but no backing ENI found (stale ELB?).")
+
+        # API Gateway custom-domain attribution by the hostname itself (the
+        # custom domain name IS the hostname). Pure Config, fail-soft.
+        self._add_apigw_matches(hostname, result, seen)
 
         if not result.matches and not result.ip_locations:
             for zr in result.zone_records:
