@@ -174,24 +174,24 @@ INDEX_HTML = """<!doctype html>
           t += `<b>${esc(tr.load_balancer)}</b> <span class=muted>(account ${esc(tr.lb_account)} · ${esc(tr.lb_region)})</span>`;
           (tr.steps || []).forEach(s => {
             if (s.error) { t += `<div class=err style="margin-left:1rem">${esc(s.step)}: ${esc(s.error)}</div>`; return; }
-            t += `<div style="margin-left:1rem">&rarr; target group <b>${esc(s.name)}</b> ` +
+            t += `<div style="margin-left:1rem;margin-top:.6rem">&rarr; target group <b>${esc(s.name)}</b> ` +
                  `<span class=muted>(${esc(s.target_type)} ${esc(s.protocol)}:${esc(s.port)})</span></div>`;
             (s.targets || []).forEach(tg => {
               t += `<div style="margin-left:2rem" class=muted>target ${esc(tg.target)} — ${esc(tg.health)}</div>`;
             });
             (s.destinations || []).forEach(dest => {
-              t += `<div style="margin-left:2rem">&rarr; via <code>${esc(dest.via_vpc_endpoint)}</code>` +
+              t += `<div style="margin-left:2rem;margin-top:.6rem">&rarr; via <code>${esc(dest.via_vpc_endpoint)}</code>` +
                    (dest.service ? ` <span class=muted>(${esc(dest.service)})</span>` : '') + `</div>`;
               const er = dest.endpoint_resource;
               if (er) {
-                t += `<div style="margin-left:3rem"><span class="tag">${esc(er.resource_type)}</span> <b>${esc(er.name)}</b></div>`;
+                t += `<div style="margin-left:3rem;margin-top:.6rem"><span class="tag">${esc(er.resource_type)}</span> <b>${esc(er.name)}</b></div>`;
                 t += `<div style="margin-left:3rem" class=muted>` +
                      `account ${esc(er.account_id)} · ${esc(er.region)}` +
                      (er.owner_contact ? ` · owner ${esc(er.owner_contact)}` : '') +
                      (er.cost_center ? ` · cost-center ${esc(er.cost_center)}` : '') +
                      `</div>`;
               } else if (dest.terminus) {
-                t += `<div style="margin-left:3rem"><span class="tag">${esc(dest.terminus)}</span></div>`;
+                t += `<div style="margin-left:3rem;margin-top:.6rem"><span class="tag">${esc(dest.terminus)}</span></div>`;
               }
             });
           });
