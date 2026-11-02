@@ -182,14 +182,27 @@ INDEX_HTML = """<!doctype html>
             (s.destinations || []).forEach(dest => {
               t += `<div style="margin-left:2rem">&rarr; via <code>${esc(dest.via_vpc_endpoint)}</code>` +
                    (dest.service ? ` <span class=muted>(${esc(dest.service)})</span>` : '') + `</div>`;
-              if (dest.terminus) t += `<div style="margin-left:3rem"><span class="tag">${esc(dest.terminus)}</span></div>`;
+              const er = dest.endpoint_resource;
+              if (er) {
+                t += `<div style="margin-left:3rem"><span class="tag">${esc(er.resource_type)}</span> <b>${esc(er.name)}</b></div>`;
+                t += `<div style="margin-left:3rem" class=muted>` +
+                     `account ${esc(er.account_id)} · ${esc(er.region)}` +
+                     (er.owner_contact ? ` · owner ${esc(er.owner_contact)}` : '') +
+                     (er.cost_center ? ` · cost-center ${esc(er.cost_center)}` : '') +
+                     `</div>`;
+              } else if (dest.terminus) {
+                t += `<div style="margin-left:3rem"><span class="tag">${esc(dest.terminus)}</span></div>`;
+              }
             });
           });
           t += `</div>`;
         });
         rows += `<tr><th>Traffic path (deep trace)</th><td>${t}</td></tr>`;
       }
-      if (d.matches && d.matches.length) {
+      // When a deep trace is present, it is the primary narrative (it names the
+      // load balancer and ends at the real endpoint), so skip the redundant
+      // Resource match(es) table to keep the result readable.
+      if (d.matches && d.matches.length && !(d.trace && d.trace.length)) {
         const attr = (label, val) => (val==null || val==='') ? '' :
           `<span class=attr><span class=lbl>${esc(label)}</span>${esc(val)}</span>`;
         rows += `<tr><th>Resource match(es)</th><td>` +

@@ -675,13 +675,20 @@ class InfraResolver:
                 f"{type(e).__name__}: {e}")
 
     # ---- Deep trace: ELB -> target groups -> targets -> VPC endpoint ------
-    def trace_elb_targets(self, lb_arn: str, account_id: str, region: str) -> list:
+    def trace_elb_targets(self, lb_arn: str, account_id: str, region: str,
+                          hostname: str = None) -> list:
         """Live cross-account trace of an ELB's forwarding path:
         listeners -> target groups -> registered targets. For IP targets that are
         VPC-endpoint ENIs, resolve the endpoint + its service (e.g. execute-api =
         private API Gateway). Requires elasticloadbalancing:Describe* and
         ec2:DescribeNetworkInterfaces/DescribeVpcEndpoints on the spoke role.
-        Returns a list of human-readable trace step dicts."""
+        Returns a list of human-readable trace step dicts.
+
+        When `hostname` is given and the path terminates at an execute-api VPC
+        endpoint (private API Gateway), resolve the actual API Gateway custom
+        domain for that hostname (owning account + owner tags) and attach it to
+        the destination as `endpoint_resource`, so the trace ends at the real
+        final endpoint instead of the generic PrivateLink terminus."""
         steps = []
         try:
             elb = self._client_for_account("elbv2", account_id, region)
@@ -723,7 +730,44 @@ class InfraResolver:
             if ip_targets:
                 self._enrich_ip_targets(ec2, ip_targets, step)
             steps.append(step)
+
+        # If the path terminates at a private API Gateway (execute-api) and we
+        # know the original hostname, resolve the actual custom domain so the
+        # trace ends at the real endpoint (owning account + owner), not the
+        # generic PrivateLink terminus.
+        if hostname:
+            self._attach_apigw_terminus(steps, hostname)
         return steps
+
+    def _attach_apigw_terminus(self, steps: list, hostname: str) -> None:
+        """For any destination whose endpoint service is execute-api, look up the
+        API Gateway custom domain for `hostname` and attach its account/owner to
+        the destination as `endpoint_resource`. Fail-soft."""
+        apigw = None
+        found = False
+        for step in steps:
+            for dest in step.get("destinations", []) or []:
+                svc = (dest.get("service") or "")
+                if "execute-api" not in svc:
+                    continue
+                if apigw is None and not found:
+                    found = True
+                    try:
+                        matches = self.attribute_apigw_custom_domain(hostname)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "API Gateway terminus lookup failed for %s: %s", hostname, e)
+                        matches = []
+                    apigw = matches[0] if matches else None
+                if apigw is not None:
+                    dest["endpoint_resource"] = {
+                        "resource_type": "API Gateway (custom domain)",
+                        "name": apigw.resource_id,
+                        "account_id": apigw.account_id,
+                        "region": apigw.region,
+                        "owner_contact": apigw.owner_contact,
+                        "cost_center": apigw.cost_center,
+                    }
 
     def _enrich_ip_targets(self, ec2, ips: list, step: dict) -> None:
         try:
@@ -868,7 +912,8 @@ class InfraResolver:
                         lb_arn = getattr(m, "_lb_arn", None)
                         if lb_arn and m.account_id and m.region:
                             try:
-                                chain = self.trace_elb_targets(lb_arn, m.account_id, m.region)
+                                chain = self.trace_elb_targets(
+                                    lb_arn, m.account_id, m.region, hostname=hostname)
                                 if chain:
                                     result.trace.append({
                                         "load_balancer": m.resource_id,
