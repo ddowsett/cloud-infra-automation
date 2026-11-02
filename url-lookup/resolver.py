@@ -28,10 +28,13 @@ import socket
 import re
 import os
 import json
+import logging
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 import boto3
+
+logger = logging.getLogger("url-infra-resolver.resolver")
 
 
 DEFAULT_AGGREGATOR = os.environ.get("RESOLVER_AGGREGATOR", "us-regions")
@@ -351,7 +354,8 @@ class InfraResolver:
         if not hasattr(self, "_caller_acct"):
             try:
                 self._caller_acct = self.sts.get_caller_identity()["Account"]
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                logger.warning("get_caller_identity failed: %s: %s", type(e).__name__, e)
                 self._caller_acct = None
         return self._caller_acct
 
@@ -408,7 +412,15 @@ class InfraResolver:
             r53 = self._route53_for_account(zone["accountId"])
             resp = r53.list_resource_record_sets(
                 HostedZoneId=zone["zoneId"], StartRecordName=hostname, MaxItems="5")
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # Surface the failure in logs -- this is the swallowed exception that
+            # previously turned an ExpiredToken / AccessDenied into a silent
+            # "no record found". Reads can legitimately fail (role not deployed in
+            # the account, cross-account denied), so we log a warning and continue.
+            logger.warning(
+                "Route53 read failed for hostname=%s in zone=%s (%s) account=%s: %s: %s",
+                hostname, zone.get("zoneName"), zone.get("zoneId"),
+                zone.get("accountId"), type(e).__name__, e)
             return None
         for rr in resp.get("ResourceRecordSets", []):
             if rr.get("Name", "").rstrip(".") != hostname:
@@ -807,7 +819,9 @@ class InfraResolver:
             f"Akamai CDN detected; following CSAA origin convention -> {origin_host}")
         try:
             candidates = self.find_candidate_zones(origin_host)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Akamai origin-follow zone discovery failed for %s: %s: %s",
+                           origin_host, type(e).__name__, e)
             return
         for zone in candidates:
             zr = self.lookup_record_in_zone(zone, origin_host)
