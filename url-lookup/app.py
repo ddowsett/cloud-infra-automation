@@ -155,16 +155,6 @@ INDEX_HTML = """<!doctype html>
           `</td></tr>`;
       }
       if (d.split_horizon) rows += `<tr><th>Split-horizon</th><td>Record found in multiple accounts</td></tr>`;
-      if (d.matches && d.matches.length) {
-        rows += `<tr><th>Resource match(es)</th><td>` +
-          d.matches.map(m => `<div><span class="tag">${esc(m.resource_type||'?')}</span> ` +
-            `<b>${esc(m.workload_hint||m.resource_id||'')}</b><br/>` +
-            `<span class=muted>account ${esc(m.account_id)} · ${esc(m.region)} · ${esc(m.resource_id)}` +
-            (m.private_ip? ' · '+esc(m.private_ip):'') +
-            (m.owner_contact? ' · owner '+esc(m.owner_contact):'') +
-            (m.cost_center? ' · cost-center '+esc(m.cost_center):'') + `</span></div>`).join('<br/>') +
-          `</td></tr>`;
-      }
       if (d.ip_locations && d.ip_locations.length) {
         rows += `<tr><th>Network location</th><td>` +
           d.ip_locations.map(l => `<div><b>${esc(l.location)}</b>` +
@@ -193,6 +183,16 @@ INDEX_HTML = """<!doctype html>
           t += `</div>`;
         });
         rows += `<tr><th>Traffic path (deep trace)</th><td>${t}</td></tr>`;
+      }
+      if (d.matches && d.matches.length) {
+        rows += `<tr><th>Resource match(es)</th><td>` +
+          d.matches.map(m => `<div><span class="tag">${esc(m.resource_type||'?')}</span> ` +
+            `<b>${esc(m.workload_hint||m.resource_id||'')}</b><br/>` +
+            `<span class=muted>account ${esc(m.account_id)} · ${esc(m.region)} · ${esc(m.resource_id)}` +
+            (m.private_ip? ' · '+esc(m.private_ip):'') +
+            (m.owner_contact? ' · owner '+esc(m.owner_contact):'') +
+            (m.cost_center? ' · cost-center '+esc(m.cost_center):'') + `</span></div>`).join('<br/>') +
+          `</td></tr>`;
       }
       if (d.notes && d.notes.length) rows += `<tr><th>Notes</th><td class=muted>${d.notes.map(esc).join('<br/>')}</td></tr>`;
       rows += `<tr><th>Audit lookup id</th><td class=muted>${esc(d.lookup_id)}</td></tr>`;
