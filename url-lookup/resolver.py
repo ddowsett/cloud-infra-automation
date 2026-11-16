@@ -160,6 +160,7 @@ class ResourceMatch:
     source: Optional[str] = None
     owner_contact: Optional[str] = None
     cost_center: Optional[str] = None
+    tags: Optional[dict] = None  # all resource tags {key: value}, when known
 
 
 @dataclass
@@ -724,10 +725,17 @@ class InfraResolver:
             if d.get("accountId") in EXCLUDED_ACCOUNTS:
                 continue
             contact, cost_center = _csaa_owner_tags(d.get("tags"))
+            # All bucket tags, csaa:* first and aws:* (CloudFormation etc.) last.
+            tag_pairs = [(t.get("key", t.get("Key")), t.get("value", t.get("Value")))
+                         for t in (d.get("tags") or []) if isinstance(t, dict)]
+            tag_pairs = [(k, v) for k, v in tag_pairs if k]
+            tag_pairs.sort(key=lambda kv: (not kv[0].startswith("csaa:"),
+                                           kv[0].startswith("aws:"), kv[0]))
             matches.append(ResourceMatch(
                 account_id=d.get("accountId"), region=d.get("awsRegion"),
                 resource_id=bucket, resource_type="S3 bucket", workload_hint=bucket,
-                owner_contact=contact, cost_center=cost_center, source="s3-bucket"))
+                owner_contact=contact, cost_center=cost_center, source="s3-bucket",
+                tags=dict(tag_pairs) or None))
         return matches
 
     def _add_s3_matches(self, bucket: str, result: ResolveResult, seen: set) -> None:

@@ -119,6 +119,8 @@ INDEX_HTML = """<!doctype html>
     .match .title { margin-bottom:.35rem; }
     .match .attr { display:block; line-height:1.5; }
     .match .attr .lbl { color:#555; display:inline-block; min-width:120px; }
+    .match .tags { margin:.15rem 0 0 1.2rem; font-size:.85rem; line-height:1.5; overflow-wrap:anywhere; }
+    .match .tags .tk { color:#555; }
     .hop { display:inline-block; min-width:1.3rem; height:1.3rem; line-height:1.3rem; text-align:center;
            background:#1662d4; color:#fff; border-radius:50%; font-size:.78rem; font-weight:600; margin-right:.4rem; }
     .site-header { margin-bottom: 1.2rem; padding-bottom: .8rem; border-bottom: 1px solid #eee; }
@@ -212,6 +214,14 @@ INDEX_HTML = """<!doctype html>
       if (d.matches && d.matches.length && !(d.trace && d.trace.length)) {
         const attr = (label, val) => (val==null || val==='') ? '' :
           `<span class=attr><span class=lbl>${esc(label)}</span>${esc(val)}</span>`;
+        // All resource tags (e.g. S3 bucket tags), one "key: value" per line.
+        const tagsBlock = (tags) => {
+          const keys = tags ? Object.keys(tags) : [];
+          if (!keys.length) return '';
+          return `<span class=attr><span class=lbl>Tags:</span></span>` +
+            `<div class=tags>` + keys.map(k =>
+              `<div><span class=tk>${esc(k)}</span>: ${esc(tags[k])}</div>`).join('') + `</div>`;
+        };
         rows += `<tr><th>Resource match(es)</th><td>` +
           d.matches.map(m => `<div class=match>` +
             `<div class=title><span class="tag">${esc(m.resource_type||'?')}</span> ` +
@@ -222,6 +232,7 @@ INDEX_HTML = """<!doctype html>
             attr('Private IP:', m.private_ip) +
             attr('Owner:', m.owner_contact) +
             attr('Cost center:', m.cost_center) +
+            tagsBlock(m.tags) +
             `</div>`).join('') +
           `</td></tr>`;
       }
