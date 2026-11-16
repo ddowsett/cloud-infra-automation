@@ -20,13 +20,23 @@ echo "== 2. App directory =="
 sudo mkdir -p "$APP_DIR"
 
 echo "== 3. Copy application files =="
-for f in app.py resolver.py audit.py requirements.txt; do
+# The repo is normally cloned to /opt/cloud-infra-automation, so running from
+# url-lookup/ means source == APP_DIR. cp then fails with "are the same file"
+# and set -e aborts the install. Only copy when they differ.
+SAME_DIR=false
+[ "$(pwd -P)" = "$(readlink -f "$APP_DIR")" ] && SAME_DIR=true
+for f in app.py resolver.py audit.py requirements.txt ip_blocks.json excluded_accounts.json; do
   if [ ! -f "./$f" ]; then
     echo "ERROR: missing $f in $(pwd). Run from the url-lookup/ dir." >&2
     exit 1
   fi
-  sudo cp "./$f" "$APP_DIR/$f"
+  if ! $SAME_DIR; then
+    sudo cp "./$f" "$APP_DIR/$f"
+  fi
 done
+if $SAME_DIR; then
+  echo "Running from $APP_DIR itself; files already in place."
+fi
 
 echo "== 4. Python venv + deps =="
 if [ ! -d "$APP_DIR/venv" ]; then

@@ -4,8 +4,7 @@
 # Run from the zone-sharing/ directory of the cloned repo, via SSM or a session.
 # Idempotent. Runs on 127.0.0.1:8080 behind nginx at /zone-sharing/.
 #
-# NOTE: this app serves index.html from /var/www/html -- ensure that file is
-# present (it is not managed by this repo unless you add it).
+# The front-end page is static/index.html in this folder.
 #
 set -euo pipefail
 
@@ -22,17 +21,24 @@ echo "== 2. App directory =="
 sudo mkdir -p "$APP_DIR"
 
 echo "== 3. Copy application files =="
-for f in ShareHostedZoneAutomation.py requirements.txt; do
+# The repo is normally cloned to /opt/cloud-infra-automation, so running from
+# zone-sharing/ means source == APP_DIR. cp then fails with "are the same file"
+# and set -e aborts the install. Only copy when they differ.
+SAME_DIR=false
+[ "$(pwd -P)" = "$(readlink -f "$APP_DIR")" ] && SAME_DIR=true
+for f in ShareHostedZoneAutomation.py requirements.txt static/index.html; do
   if [ ! -f "./$f" ]; then
     echo "ERROR: missing $f in $(pwd). Run from the zone-sharing/ dir." >&2
     exit 1
   fi
-  sudo cp "./$f" "$APP_DIR/$f"
 done
-
-# Bundle the static front-end (index.html) with the app.
-sudo mkdir -p "$APP_DIR/static"
-sudo cp ./static/index.html "$APP_DIR/static/index.html"
+if $SAME_DIR; then
+  echo "Running from $APP_DIR itself; files already in place."
+else
+  sudo cp ./ShareHostedZoneAutomation.py ./requirements.txt "$APP_DIR/"
+  sudo mkdir -p "$APP_DIR/static"
+  sudo cp ./static/index.html "$APP_DIR/static/index.html"
+fi
 
 echo "== 4. Python venv + deps =="
 if [ ! -d "$APP_DIR/venv" ]; then

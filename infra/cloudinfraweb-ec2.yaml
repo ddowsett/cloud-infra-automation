@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CSAA Cloud Infrastructure web host (resolver + zone-sharing behind nginx).
+  Rebuilt from the live DEV instance i-0107991ec9add020e so DEV and PROD are
+  identical except AMI, Name, csaa:environment, and the auto-assigned private IP.
+  SSM-only access (no SSH key). IMDSv2 required.
+
+# ---------------------------------------------------------------------------
+# WHY THIS TEMPLATE EXISTS
+# The original "ec2Builder" stack template had drifted from reality: it still
+# referenced Cloud9Role, required an SSH key, created its own security group,
+# and carried a different tag set. The running DEV box was later hardened to
+# CloudInfraEc2Role, SSM-only (no key), the existing SG sg-088ce971fce0eaaa2,
+# and the standard CSAA tag set. This template encodes the ACTUAL dev state so
+# prod is a faithful copy.
+#
+# Observed DEV attributes mirrored here:
+#   InstanceType  t3.medium
+#   Subnet        subnet-002fbae03403af676 (us-west-2a)
+#   VPC           vpc-0b4f4435b85d3adda
+#   SecurityGroup sg-088ce971fce0eaaa2 (reused)
+#   IAM profile   CloudInfraEc2Role
+#   IMDS          HttpTokens=required, HopLimit=2, endpoint enabled
+#   Root volume   20 GiB gp3
+#   Key pair      none (SSM Session Manager only)
+# ---------------------------------------------------------------------------
+
+Parameters:
+  InstanceName:
+    Type: String
+    Default: CloudInfraWebProd
+    Description: Value for the Name tag.
+
+  Environment:
+    Type: String
+    Default: PROD
+    AllowedValues: [DEV, PROD]
+    Description: Value for the csaa:environment tag.
+
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI to launch. PROD = ami-08785e7ce8b3b39e6.
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+    Description: EC2 instance type (dev is t3.medium).
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-002fbae03403af676
+    Description: Subnet to launch into (dev subnet, us-west-2a).
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-088ce971fce0eaaa2
+    Description: Existing security group to attach (reuse the dev SG).
+
+  IamInstanceProfile:
+    Type: String
+    Default: CloudInfraEc2Role
+    Description: Name of the existing IAM instance profile.
+
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    Description: Root EBS volume size in GiB.
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref ImageId
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      IamInstanceProfile: !Ref IamInstanceProfile
+      # No KeyName on purpose: access is via SSM Session Manager only.
+      MetadataOptions:
+        HttpTokens: required          # IMDSv2 enforced
+        HttpPutResponseHopLimit: 2    # matches dev
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGiB
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+        - Key: csaa:cost-center
+          Value: "26860"
+        - Key: csaa:support-group
+          Value: "Cloud Infrastructure"
+        - Key: csaa:contact
+          Value: "dlcloudinfrastructure@csaa.com"
+        - Key: csaa:application
+          Value: "344327960130"
+        - Key: csaa:environment
+          Value: !Ref Environment
+
+Outputs:
+  InstanceId:
+    Description: ID of the newly created EC2 instance.
+    Value: !Ref EC2Instance
+  PrivateIp:
+    Description: Auto-assigned private IP (point the prod DNS A record here).
+    Value: !GetAtt EC2Instance.PrivateIp
+  AvailabilityZone:
+    Description: AZ the instance landed in.
+    Value: !GetAtt EC2Instance.AvailabilityZone
