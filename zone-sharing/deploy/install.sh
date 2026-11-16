@@ -12,9 +12,17 @@ APP_DIR=/opt/cloud-infra-automation/zone-sharing
 SVC=zone-sharing
 SVC_USER=zonesharing
 
-echo "== 1. Service user =="
+echo "== 1. Service user + group =="
+# Create the group explicitly: on some images (e.g. the CSAA AL2023 base image)
+# `useradd --system` does not create a same-named group, which breaks the
+# chown below and the unit's Group= line.
+if ! getent group "$SVC_USER" >/dev/null; then
+  sudo groupadd --system "$SVC_USER"
+fi
 if ! id "$SVC_USER" >/dev/null 2>&1; then
-  sudo useradd --system --no-create-home --shell /sbin/nologin "$SVC_USER"
+  sudo useradd --system --no-create-home --shell /sbin/nologin -g "$SVC_USER" "$SVC_USER"
+else
+  sudo usermod -g "$SVC_USER" "$SVC_USER"
 fi
 
 echo "== 2. App directory =="
