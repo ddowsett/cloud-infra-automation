@@ -119,8 +119,8 @@ INDEX_HTML = """<!doctype html>
     .match .title { margin-bottom:.35rem; }
     .match .attr { display:block; line-height:1.5; }
     .match .attr .lbl { color:#555; display:inline-block; min-width:120px; }
-    .match .tags { margin:.15rem 0 0 1.2rem; font-size:.85rem; line-height:1.5; overflow-wrap:anywhere; }
-    .match .tags .tk { color:#555; }
+    .tags { margin:.15rem 0 0 1.2rem; font-size:.85rem; line-height:1.5; overflow-wrap:anywhere; }
+    .tags .tk { color:#555; }
     .hop { display:inline-block; min-width:1.3rem; height:1.3rem; line-height:1.3rem; text-align:center;
            background:#1662d4; color:#fff; border-radius:50%; font-size:.78rem; font-weight:600; margin-right:.4rem; }
     .site-header { margin-bottom: 1.2rem; padding-bottom: .8rem; border-bottom: 1px solid #eee; }
@@ -155,6 +155,19 @@ INDEX_HTML = """<!doctype html>
       } finally { $('go').disabled = false; }
     }
     function esc(s){ return (s==null?'':String(s)).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+    // All resource tags as "key: value" lines ('' when there are none).
+    function tagList(tags) {
+      const keys = tags ? Object.keys(tags) : [];
+      if (!keys.length) return '';
+      return `<div class=tags>` + keys.map(k =>
+        `<div><span class=tk>${esc(k)}</span>: ${esc(tags[k])}</div>`).join('') + `</div>`;
+    }
+    // Tags for a traffic-path hop, indented under that hop.
+    function traceTags(tags) {
+      const list = tagList(tags);
+      return list ? `<div style="margin-left:2.7rem" class=muted>Tags:</div>` +
+                    `<div style="margin-left:1.5rem">${list}</div>` : '';
+    }
     function render(d) {
       let rows = '';
       rows += `<tr><th>Hostname</th><td>${esc(d.hostname)}</td></tr>`;
@@ -181,6 +194,7 @@ INDEX_HTML = """<!doctype html>
           const num = () => `<span class=hop>${++hop}</span>`;
           t += `<div style="margin-bottom:.6rem">`;
           t += `${num()}<b>${esc(tr.load_balancer)}</b> <span class=muted>(account ${esc(tr.lb_account)} · ${esc(tr.lb_region)})</span>`;
+          t += traceTags(tr.lb_tags);
           (tr.steps || []).forEach(s => {
             if (s.error) { t += `<div class=err style="margin-left:1rem">${esc(s.step)}: ${esc(s.error)}</div>`; return; }
             t += `<div style="margin-left:1rem;margin-top:.6rem">${num()}target group <b>${esc(s.name)}</b> ` +
@@ -199,6 +213,7 @@ INDEX_HTML = """<!doctype html>
                      (er.owner_contact ? ` · owner ${esc(er.owner_contact)}` : '') +
                      (er.cost_center ? ` · cost-center ${esc(er.cost_center)}` : '') +
                      `</div>`;
+                t += traceTags(er.tags);
               } else if (dest.terminus) {
                 t += `<div style="margin-left:1rem;margin-top:.6rem">${num()}<span class="tag">${esc(dest.terminus)}</span></div>`;
               }
@@ -214,13 +229,9 @@ INDEX_HTML = """<!doctype html>
       if (d.matches && d.matches.length && !(d.trace && d.trace.length)) {
         const attr = (label, val) => (val==null || val==='') ? '' :
           `<span class=attr><span class=lbl>${esc(label)}</span>${esc(val)}</span>`;
-        // All resource tags (e.g. S3 bucket tags), one "key: value" per line.
         const tagsBlock = (tags) => {
-          const keys = tags ? Object.keys(tags) : [];
-          if (!keys.length) return '';
-          return `<span class=attr><span class=lbl>Tags:</span></span>` +
-            `<div class=tags>` + keys.map(k =>
-              `<div><span class=tk>${esc(k)}</span>: ${esc(tags[k])}</div>`).join('') + `</div>`;
+          const list = tagList(tags);
+          return list ? `<span class=attr><span class=lbl>Tags:</span></span>` + list : '';
         };
         rows += `<tr><th>Resource match(es)</th><td>` +
           d.matches.map(m => `<div class=match>` +

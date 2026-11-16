@@ -105,20 +105,35 @@ def _s3_bucket_from_url(url: str, hostname: str) -> Optional[str]:
     return first if _S3_BUCKET_RE.match(first) else None
 
 
-def _csaa_owner_tags(tags) -> tuple:
-    """(csaa:contact, csaa:cost-center) from a Config tag list. Config uses
-    lowercase key/value on the top-level `tags` field; accept either casing."""
-    contact = cost_center = None
-    for t in (tags or []):
-        if not isinstance(t, dict):
-            continue
-        k = t.get("key", t.get("Key"))
-        v = t.get("value", t.get("Value"))
-        if k == "csaa:contact":
-            contact = v
-        elif k == "csaa:cost-center":
-            cost_center = v
-    return contact, cost_center
+def _tags_dict(raw) -> Optional[dict]:
+    """Normalize resource tags to an ordered {key: value} dict, or None if empty.
+    Accepts Config's top-level `tags` list ({key, value}), the {Key, Value} list
+    some configuration blobs use, or a plain dict.
+    Order: csaa:* first, then other tags, aws:* (CloudFormation etc.) last."""
+    if isinstance(raw, dict):
+        pairs = [(k, v) for k, v in raw.items() if k]
+    else:
+        pairs = []
+        for t in (raw or []):
+            if isinstance(t, dict):
+                k = t.get("key", t.get("Key"))
+                if k:
+                    pairs.append((k, t.get("value", t.get("Value"))))
+    if not pairs:
+        return None
+    pairs.sort(key=lambda kv: (not kv[0].startswith("csaa:"), kv[0].startswith("aws:"), kv[0]))
+    return dict(pairs)
+
+
+def _apply_tags(m, raw):
+    """Set m.tags from raw tags and fill owner / cost center from the standard
+    csaa:contact / csaa:cost-center tags when not already known."""
+    tags = _tags_dict(raw)
+    m.tags = tags
+    if tags:
+        m.owner_contact = m.owner_contact or tags.get("csaa:contact")
+        m.cost_center = m.cost_center or tags.get("csaa:cost-center")
+    return m
 
 # Path to the CSAA CIDR -> location map (tiers 4/5 fallback). Sits next to this file.
 IP_BLOCKS_FILE = os.environ.get(
@@ -347,7 +362,7 @@ class InfraResolver:
         if self._subnet_inventory is not None:
             return self._subnet_inventory
         rows = self._select_all(
-            "SELECT accountId, awsRegion, resourceId, configuration.cidrBlock, "
+            "SELECT accountId, awsRegion, resourceId, tags, configuration.cidrBlock, "
             "configuration.vpcId "
             "WHERE resourceType = 'AWS::EC2::Subnet'")
         subs = []
@@ -365,7 +380,7 @@ class InfraResolver:
                 continue
             subs.append({"net": net, "accountId": d.get("accountId"),
                          "region": d.get("awsRegion"), "subnetId": d.get("resourceId"),
-                         "vpcId": c.get("vpcId")})
+                         "vpcId": c.get("vpcId"), "tags": d.get("tags")})
         self._subnet_inventory = subs
         return subs
 
@@ -373,7 +388,7 @@ class InfraResolver:
         if self._vpc_inventory is not None:
             return self._vpc_inventory
         rows = self._select_all(
-            "SELECT accountId, awsRegion, resourceId, configuration.cidrBlock "
+            "SELECT accountId, awsRegion, resourceId, tags, configuration.cidrBlock "
             "WHERE resourceType = 'AWS::EC2::VPC'")
         vpcs = []
         for row in rows:
@@ -518,7 +533,7 @@ class InfraResolver:
     # ---- Tier 1: ENI ------------------------------------------------------
     def attribute_ip_eni(self, ip: str, source: str = "eni") -> list:
         expr = (
-            "SELECT accountId, awsRegion, resourceId, configuration.privateIpAddress, "
+            "SELECT accountId, awsRegion, resourceId, tags, configuration.privateIpAddress, "
             "configuration.description, configuration.interfaceType, "
             "configuration.attachment.instanceId, configuration.vpcId, configuration.subnetId "
             "WHERE resourceType = 'AWS::EC2::NetworkInterface' "
@@ -530,6 +545,7 @@ class InfraResolver:
         except Exception as e:  # noqa: BLE001
             return [ResourceMatch(private_ip=ip, description=f"Config query error: {e}", source=source)]
         matches = []
+        eni_tags = []  # raw ENI tags, parallel to `matches`
         for row in resp.get("Results", []):
             d = json.loads(row)
             if d.get("accountId") in EXCLUDED_ACCOUNTS:
@@ -548,7 +564,35 @@ class InfraResolver:
                 description=desc, interface_type=itype, resource_type=rtype,
                 workload_hint=workload, attached_instance_id=instance_id,
                 vpc_id=cfg.get("vpcId"), subnet_id=cfg.get("subnetId"), source=source))
+            eni_tags.append(d.get("tags"))
+        # ENIs rarely carry tags; the attached EC2 instance does. Prefer its tags.
+        inst_tags = self._instance_tags(
+            sorted({m.attached_instance_id for m in matches if m.attached_instance_id}))
+        for m, raw in zip(matches, eni_tags):
+            _apply_tags(m, inst_tags.get(m.attached_instance_id) or raw)
         return matches
+
+    def _instance_tags(self, instance_ids: list) -> dict:
+        """{instance_id: raw Config tags} for EC2 instances, in one query.
+        Fails soft: logs and returns {} on error."""
+        ids = [i for i in instance_ids if re.fullmatch(r"i-[0-9a-f]+", i or "")]
+        if not ids:
+            return {}
+        in_list = ", ".join(f"'{i}'" for i in ids)
+        try:
+            resp = self.config.select_aggregate_resource_config(
+                Expression=("SELECT resourceId, tags WHERE resourceType = 'AWS::EC2::Instance' "
+                            f"AND resourceId IN ({in_list})"),
+                ConfigurationAggregatorName=self.aggregator_name, Limit=100)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("EC2 instance tag query failed for %s: %s: %s",
+                           ids, type(e).__name__, e)
+            return {}
+        out = {}
+        for row in resp.get("Results", []):
+            d = json.loads(row)
+            out[d.get("resourceId")] = d.get("tags")
+        return out
 
     # ---- Tiers 2/3: subnet / VPC containment ------------------------------
     def attribute_ip_by_network(self, ip: str) -> Optional[ResourceMatch]:
@@ -564,12 +608,12 @@ class InfraResolver:
                 if best is None or net.prefixlen > best["net"].prefixlen:
                     best = s
         if best:
-            return ResourceMatch(
+            return _apply_tags(ResourceMatch(
                 account_id=best["accountId"], region=best["region"],
                 resource_id=best["subnetId"], private_ip=ip,
                 resource_type="Subnet (no ENI for exact IP)",
                 workload_hint=f"in {best['vpcId']}", vpc_id=best["vpcId"],
-                subnet_id=best["subnetId"], source="subnet-cidr")
+                subnet_id=best["subnetId"], source="subnet-cidr"), best.get("tags"))
         # Tier 3: containing VPC.
         bestv = None
         for v in self._load_vpc_inventory():
@@ -578,16 +622,16 @@ class InfraResolver:
                 if bestv is None or net.prefixlen > bestv["net"].prefixlen:
                     bestv = v
         if bestv:
-            return ResourceMatch(
+            return _apply_tags(ResourceMatch(
                 account_id=bestv["accountId"], region=bestv["region"],
                 resource_id=bestv["vpcId"], private_ip=ip,
                 resource_type="VPC (no ENI/subnet for exact IP)",
-                vpc_id=bestv["vpcId"], source="vpc-cidr")
+                vpc_id=bestv["vpcId"], source="vpc-cidr"), bestv.get("tags"))
         return None
 
     # ---- CloudFront / ELB alias attribution -------------------------------
     def _cf_match(self, where_clause: str, source: str) -> list:
-        expr = ("SELECT accountId, resourceId, configuration.domainName, "
+        expr = ("SELECT accountId, resourceId, tags, configuration.domainName, "
                 "configuration.distributionConfig.aliases.items "
                 "WHERE resourceType = 'AWS::CloudFront::Distribution' "
                 f"AND {where_clause}")
@@ -602,10 +646,10 @@ class InfraResolver:
             if d.get("accountId") in EXCLUDED_ACCOUNTS:
                 continue
             cfg = d.get("configuration", {}) or {}
-            matches.append(ResourceMatch(
+            matches.append(_apply_tags(ResourceMatch(
                 account_id=d.get("accountId"), region="global", resource_id=d.get("resourceId"),
                 resource_type="CloudFront distribution", workload_hint=cfg.get("domainName"),
-                source=source))
+                source=source), d.get("tags")))
         return matches
 
     def attribute_cloudfront_by_alias(self, hostname: str) -> list:
@@ -620,7 +664,7 @@ class InfraResolver:
         AWS::ElasticLoadBalancingV2::LoadBalancer dNSName attribute. Precise:
         one DNS name -> one LB -> one account (no ENI fan-out / name lookalikes)."""
         target = (alias_dns or "").rstrip(".")
-        expr = ("SELECT accountId, awsRegion, resourceId, resourceName, arn, "
+        expr = ("SELECT accountId, awsRegion, resourceId, resourceName, arn, tags, "
                 "configuration.type, configuration.scheme, configuration.dNSName, "
                 "configuration.loadBalancerArn "
                 "WHERE resourceType = 'AWS::ElasticLoadBalancingV2::LoadBalancer' "
@@ -644,6 +688,7 @@ class InfraResolver:
                     resource_type=rtype,
                     workload_hint=f"{d.get('resourceName')} ({scheme})" if scheme else d.get("resourceName"),
                     description=c.get("dNSName"), source="alias-elb-dns")
+                _apply_tags(m, d.get("tags"))
                 # Stash the LB ARN for the deep-trace (not serialized on the match).
                 m._lb_arn = c.get("loadBalancerArn") or d.get("arn")
                 matches.append(m)
@@ -687,24 +732,12 @@ class InfraResolver:
             if d.get("accountId") in EXCLUDED_ACCOUNTS:
                 continue
             cfg = d.get("configuration", {}) or {}
-            owner_contact = None
-            cost_center = None
-            for tag in (cfg.get("Tags") or []):
-                if not isinstance(tag, dict):
-                    continue
-                k = tag.get("Key")
-                v = tag.get("Value")
-                if k == "csaa:contact":
-                    owner_contact = v
-                elif k == "csaa:cost-center":
-                    cost_center = v
-            matches.append(ResourceMatch(
+            matches.append(_apply_tags(ResourceMatch(
                 account_id=d.get("accountId"), region=d.get("awsRegion"),
                 resource_id=cfg.get("DomainName") or d.get("resourceId"),
                 resource_type="API Gateway (custom domain)",
                 workload_hint=cfg.get("RegionalDomainName"),
-                owner_contact=owner_contact, cost_center=cost_center,
-                source="apigw-custom-domain"))
+                source="apigw-custom-domain"), cfg.get("Tags")))
         return matches
 
     # ---- S3 bucket attribution (pure Config) ------------------------------
@@ -724,18 +757,10 @@ class InfraResolver:
             d = json.loads(row)
             if d.get("accountId") in EXCLUDED_ACCOUNTS:
                 continue
-            contact, cost_center = _csaa_owner_tags(d.get("tags"))
-            # All bucket tags, csaa:* first and aws:* (CloudFormation etc.) last.
-            tag_pairs = [(t.get("key", t.get("Key")), t.get("value", t.get("Value")))
-                         for t in (d.get("tags") or []) if isinstance(t, dict)]
-            tag_pairs = [(k, v) for k, v in tag_pairs if k]
-            tag_pairs.sort(key=lambda kv: (not kv[0].startswith("csaa:"),
-                                           kv[0].startswith("aws:"), kv[0]))
-            matches.append(ResourceMatch(
+            matches.append(_apply_tags(ResourceMatch(
                 account_id=d.get("accountId"), region=d.get("awsRegion"),
                 resource_id=bucket, resource_type="S3 bucket", workload_hint=bucket,
-                owner_contact=contact, cost_center=cost_center, source="s3-bucket",
-                tags=dict(tag_pairs) or None))
+                source="s3-bucket"), d.get("tags")))
         return matches
 
     def _add_s3_matches(self, bucket: str, result: ResolveResult, seen: set) -> None:
@@ -861,6 +886,7 @@ class InfraResolver:
                         "region": apigw.region,
                         "owner_contact": apigw.owner_contact,
                         "cost_center": apigw.cost_center,
+                        "tags": apigw.tags,
                     }
 
     def _enrich_ip_targets(self, ec2, ips: list, step: dict) -> None:
@@ -1037,6 +1063,7 @@ class InfraResolver:
                                         "load_balancer": m.resource_id,
                                         "lb_account": m.account_id,
                                         "lb_region": m.region,
+                                        "lb_tags": m.tags,
                                         "steps": chain,
                                     })
                             except Exception as e:  # noqa: BLE001
