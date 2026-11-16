@@ -53,8 +53,12 @@ sudo openssl x509 -in /opt/managedcerts/server.crt -noout -subject -enddate -ext
 ```
 
 If the files are missing or the SAN doesn't list the prod name, request the cert
-the same way dev's was obtained before continuing. nginx will not start the
-HTTPS config without these files.
+the same way dev's was obtained. Until it's installed, run prod on HTTP with
+`nginx/cloud-infra-http.conf` (Step 6). The HTTPS config won't start without
+these files.
+
+**Status:** prod has no cert yet (`/opt/managedcerts` doesn't exist). Running
+HTTP-only for now.
 
 ## Step 5 — Clone the repo and install the apps
 
@@ -89,21 +93,31 @@ If that prints any line that isn't commented out (`#`), back the file up
 `server { ... }` blocks. Keep `include /etc/nginx/conf.d/*.conf;` and the closing
 `}` of the `http` block.
 
-Then install the HTTPS config from the repo (same file dev uses):
+Then install the nginx config from the repo.
 
+**No cert yet: HTTP only**
+```bash
+sudo cp /opt/cloud-infra-automation/nginx/cloud-infra-http.conf /etc/nginx/conf.d/cloud-infra.conf
+sudo nginx -t && sudo systemctl restart nginx
+```
+
+**Cert installed: HTTPS** (same file dev uses; port 80 redirects to HTTPS)
 ```bash
 sudo cp /opt/cloud-infra-automation/nginx/cloud-infra-interim.conf /etc/nginx/conf.d/cloud-infra.conf
-sudo nginx -t && sudo systemctl restart nginx
+sudo nginx -t && sudo systemctl reload nginx
 ```
 
 ## Step 7 — Verify
 
+HTTP only:
 ```bash
-curl -s -o /dev/null -w "landing %{http_code}\n"    https://cloudinfraweb.np.aws.csaa.pri/
-curl -s -o /dev/null -w "url-lookup %{http_code}\n" https://cloudinfraweb.np.aws.csaa.pri/url-lookup/
+curl -s -o /dev/null -w "landing %{http_code}\n"    http://cloudinfraweb.np.aws.csaa.pri/
+curl -s -o /dev/null -w "url-lookup %{http_code}\n" http://cloudinfraweb.np.aws.csaa.pri/url-lookup/
 ```
 
-Both should print `200` (no `-k`, so this also proves the cert is trusted). If
+After the cert (HTTPS), use `https://`. No `-k`, so this also proves the cert is trusted.
+
+Both should print `200`. If
 the instance can't resolve the name, run `sudo resolvectl flush-caches` (same as
 dev). Then in a browser, resolve `cdh-e2e.private.np.aws.csaa.pri` and an S3
 URL such as `csaa-ds-releases.s3.amazonaws.com`.
