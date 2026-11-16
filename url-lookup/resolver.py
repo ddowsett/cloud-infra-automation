@@ -31,6 +31,7 @@ import json
 import logging
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+from urllib.parse import urlsplit
 
 import boto3
 
@@ -75,6 +76,49 @@ def _is_apigw_regional_domain(name: str) -> bool:
     whose label chain is .execute-api.<region>.amazonaws.com."""
     n = (name or "").rstrip(".").lower()
     return n.startswith("d-") and ".execute-api." in n and n.endswith(".amazonaws.com")
+
+
+# S3 endpoint hostnames. The optional leading label is the bucket (virtual-hosted
+# style); without it the bucket is the first path segment (path style). Covers:
+#   s3.amazonaws.com, s3.<region>, s3-<region>, s3.dualstack.<region>,
+#   s3-website-<region>, s3-website.<region>   (all + .amazonaws.com)
+_S3_REGION = r"[a-z]{2}(?:-gov)?-[a-z]+-\d"
+_S3_ENDPOINT = rf"s3(?:\.dualstack)?(?:[.\-]{_S3_REGION})?|s3-website[.\-]{_S3_REGION}"
+_S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
+_S3_HOST_RE = re.compile(
+    rf"^(?:(?P<bucket>[a-z0-9][a-z0-9.\-]{{1,61}}[a-z0-9])\.)?(?:{_S3_ENDPOINT})\.amazonaws\.com$")
+
+
+def _s3_bucket_from_url(url: str, hostname: str) -> Optional[str]:
+    """Bucket name if the URL is an S3 endpoint, else None.
+    Virtual-hosted: csaa-ds-releases.s3.amazonaws.com        -> csaa-ds-releases
+    Path style:     s3.us-west-2.amazonaws.com/my-bucket/key -> my-bucket"""
+    m = _S3_HOST_RE.match((hostname or "").rstrip(".").lower())
+    if not m:
+        return None
+    if m.group("bucket"):
+        return m.group("bucket")
+    raw = (url or "").strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    first = urlsplit(raw).path.lstrip("/").split("/", 1)[0].lower()
+    return first if _S3_BUCKET_RE.match(first) else None
+
+
+def _csaa_owner_tags(tags) -> tuple:
+    """(csaa:contact, csaa:cost-center) from a Config tag list. Config uses
+    lowercase key/value on the top-level `tags` field; accept either casing."""
+    contact = cost_center = None
+    for t in (tags or []):
+        if not isinstance(t, dict):
+            continue
+        k = t.get("key", t.get("Key"))
+        v = t.get("value", t.get("Value"))
+        if k == "csaa:contact":
+            contact = v
+        elif k == "csaa:cost-center":
+            cost_center = v
+    return contact, cost_center
 
 # Path to the CSAA CIDR -> location map (tiers 4/5 fallback). Sits next to this file.
 IP_BLOCKS_FILE = os.environ.get(
@@ -662,6 +706,48 @@ class InfraResolver:
                 source="apigw-custom-domain"))
         return matches
 
+    # ---- S3 bucket attribution (pure Config) ------------------------------
+    def attribute_s3_bucket(self, bucket: str) -> list:
+        """Find the account/region that owns an S3 bucket via Config
+        (AWS::S3::Bucket, resourceName == bucket). Bucket names are globally
+        unique, so this is an exact lookup. Raises on query error."""
+        if not _S3_BUCKET_RE.match(bucket or ""):
+            return []  # also guarantees the name is safe to put in the query
+        expr = ("SELECT accountId, awsRegion, resourceName, tags "
+                "WHERE resourceType = 'AWS::S3::Bucket' "
+                f"AND resourceName = '{bucket}'")
+        resp = self.config.select_aggregate_resource_config(
+            Expression=expr, ConfigurationAggregatorName=self.aggregator_name, Limit=10)
+        matches = []
+        for row in resp.get("Results", []):
+            d = json.loads(row)
+            if d.get("accountId") in EXCLUDED_ACCOUNTS:
+                continue
+            contact, cost_center = _csaa_owner_tags(d.get("tags"))
+            matches.append(ResourceMatch(
+                account_id=d.get("accountId"), region=d.get("awsRegion"),
+                resource_id=bucket, resource_type="S3 bucket", workload_hint=bucket,
+                owner_contact=contact, cost_center=cost_center, source="s3-bucket"))
+        return matches
+
+    def _add_s3_matches(self, bucket: str, result: ResolveResult, seen: set) -> None:
+        """Add the owning account for `bucket`, or a plain-language note if Config
+        has no record of it. Fails soft on Config errors."""
+        try:
+            found = self.attribute_s3_bucket(bucket)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("S3 bucket Config query failed for %s: %s: %s",
+                           bucket, type(e).__name__, e)
+            result.notes.append(f"S3 bucket lookup for '{bucket}' failed: {type(e).__name__}: {e}")
+            return
+        if found:
+            for m in found:
+                self._add_match(result, seen, m)
+        else:
+            result.notes.append(
+                f"S3 bucket '{bucket}' was not found in AWS Config. It may belong to an "
+                "account outside the CSAA organization, or to an excluded (sandbox) account.")
+
     def _add_apigw_matches(self, name: str, result: ResolveResult, seen: set) -> None:
         """Run the pure-Config API Gateway custom-domain lookup for `name` and add
         any matches. Fails soft: on Config error, append a note instead of raising
@@ -848,10 +934,24 @@ class InfraResolver:
             if m.account_id:
                 self._add_match(result, seen, m)
 
+        # S3 endpoint URL (bucket.s3.amazonaws.com, path style, website, ...):
+        # the bucket name identifies the owning account via Config.
+        is_s3_host = bool(_S3_HOST_RE.match(hostname.rstrip(".").lower()))
+        s3_bucket = _s3_bucket_from_url(url, hostname)
+        if s3_bucket:
+            self._add_s3_matches(s3_bucket, result, seen)
+        elif is_s3_host:
+            result.notes.append("S3 endpoint URL, but no bucket name was found in it.")
+        if is_s3_host and ips:
+            result.notes.append(
+                "Resolved IPs are shared Amazon S3 endpoints; they don't show where the bucket lives.")
+
         # Live-DNS IPs.
         for ip in ips:
             if _is_private_ip(ip):
                 self.attribute_ip(ip, result, seen, source_tag="dns-ip")
+            elif is_s3_host:
+                continue  # shared S3 front-end IP, not the bucket's location
             else:
                 # Public IP: record its generic/public classification (tier 4/5),
                 # since ENI/subnet attribution only applies to private IPs.
@@ -871,6 +971,11 @@ class InfraResolver:
                             self._add_match(result, seen, m)
                 elif any(val.endswith(s) for s in AKAMAI_SUFFIXES):
                     self._follow_akamai_origin(hostname, result, seen)
+                elif _S3_HOST_RE.match(val.lower()):
+                    # CNAME to an S3 endpoint. With no bucket label (website
+                    # endpoint), S3 requires the bucket name to equal the hostname.
+                    bkt = _S3_HOST_RE.match(val.lower()).group("bucket") or hostname.lower()
+                    self._add_s3_matches(bkt, result, seen)
                 else:
                     try:
                         ipaddress.ip_address(val)  # is it a literal public IP?
@@ -893,6 +998,11 @@ class InfraResolver:
                 continue
             if _is_apigw_regional_domain(alias):
                 self._add_apigw_matches(alias, result, seen)
+            s3_alias = _S3_HOST_RE.match(alias.lower())
+            if s3_alias:
+                # Route 53 alias to an S3 website endpoint carries no bucket name;
+                # S3 requires the bucket to be named exactly like the record.
+                self._add_s3_matches(s3_alias.group("bucket") or hostname.lower(), result, seen)
             if alias.endswith(CLOUDFRONT_SUFFIX):
                 cf = self.attribute_cloudfront_by_domain(alias)
                 if any(m.account_id for m in cf):
