@@ -323,7 +323,9 @@ class InfraResolver:
     # ---- Step 1: DNS ------------------------------------------------------
     def resolve_dns(self, hostname: str):
         try:
-            infos = socket.getaddrinfo(hostname, None)
+            # IPv4 only: IPv6 answers (e.g. CloudFront's 2600:9000::/28) add noise
+            # and nothing in the CSAA estate is attributed by IPv6.
+            infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
             ips = sorted({i[4][0] for i in infos})
             return ips, None
         except Exception as e:  # noqa: BLE001
@@ -1038,6 +1040,8 @@ class InfraResolver:
         for zr in result.zone_records:
             for ip in zr.get("values", []) or []:
                 val = (ip or "").rstrip(".")
+                if ":" in val:
+                    continue  # IPv6 (AAAA value): not shown, same as live DNS
                 if _is_private_ip(val):
                     self.attribute_ip(val, result, seen, source_tag="a-record-ip")
                 elif val.endswith(CLOUDFRONT_SUFFIX):
