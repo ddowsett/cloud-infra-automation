@@ -526,9 +526,50 @@ class InfraResolver:
                 f"Split-horizon: the record exists in {len(found)} zones across "
                 f"accounts {sorted({z.zone_account_id for z in found})}.")
         if not found:
-            result.notes.append(
-                "Hostname suffixes a known zone, but no exact record found in any "
-                "candidate zone.")
+            deleg = self._find_unknown_delegation(candidates, hostname)
+            if deleg:
+                sub, parent = deleg
+                result.notes.append(
+                    f"{sub} is delegated from {parent['zoneName']} (account "
+                    f"{parent['accountId']}) to a hosted zone outside the AWS Config inventory.")
+            else:
+                result.notes.append(
+                    "Hostname suffixes a known zone, but no exact record found in any "
+                    "candidate zone.")
+
+    def _find_unknown_delegation(self, candidates: list, hostname: str):
+        """If a candidate (parent) zone delegates part of `hostname` to another
+        zone via an NS record, and that delegated zone isn't in the Config
+        inventory, return (delegated_name, parent_zone). Otherwise None.
+        Example: ng.csaa-insurance.aaa.com has NS for p.ng.csaa-insurance.aaa.com,
+        so dash.p.ng... lives in a zone the resolver can't see."""
+        known = {z["zoneName"].lower() for z in self._load_zone_inventory() if z.get("zoneName")}
+        host = hostname.rstrip(".").lower()
+        for zone in candidates:  # most specific zone first
+            zname = zone["zoneName"].lower()
+            extra = host[: -len(zname)].rstrip(".").split(".") if host != zname else []
+            # Names between the zone and the hostname, closest to the zone first:
+            # for dash.p.ng.x in ng.x -> p.ng.x, then dash.p.ng.x
+            names = [".".join(extra[i:] + [zname]) for i in range(len(extra) - 1, -1, -1)]
+            try:
+                r53 = self._route53_for_account(zone["accountId"])
+            except Exception:  # noqa: BLE001
+                continue
+            for name in names:
+                if name in known:
+                    break  # a deeper zone we do know about; not an unknown delegation
+                try:
+                    rr = r53.list_resource_record_sets(
+                        HostedZoneId=zone["zoneId"], StartRecordName=name,
+                        StartRecordType="NS", MaxItems="1").get("ResourceRecordSets", [])
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("NS delegation check failed for %s in zone=%s account=%s: %s: %s",
+                                   name, zone.get("zoneName"), zone.get("accountId"),
+                                   type(e).__name__, e)
+                    break
+                if rr and rr[0].get("Type") == "NS" and rr[0].get("Name", "").rstrip(".").lower() == name:
+                    return name, zone
+        return None
 
     # ---- Tier 1: ENI ------------------------------------------------------
     def attribute_ip_eni(self, ip: str, source: str = "eni") -> list:
