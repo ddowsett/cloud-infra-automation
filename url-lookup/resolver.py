@@ -43,6 +43,15 @@ AGGREGATOR_REGION = os.environ.get("RESOLVER_AGGREGATOR_REGION", "us-west-2")
 ASSUME_ROLE_NAME = os.environ.get("RESOLVER_ASSUME_ROLE", "CsaaInfraResolverReadRole")
 
 AKAMAI_SUFFIXES = ("edgekey.net", "akamaiedge.net", "edgesuite.net")
+
+# Suffixes tried, in order, when a user enters a short name (no dots), matching a
+# CSAA workstation's DNS search list. Override with RESOLVER_DNS_SUFFIXES
+# (comma-separated).
+DNS_SEARCH_SUFFIXES = tuple(
+    s.strip().strip(".") for s in os.environ.get(
+        "RESOLVER_DNS_SUFFIXES",
+        "ent.rt.csaa.com,rt.csaa.com,csaa.com,westernunited.com,tent.trt.csaa.pri,trt.csaa.pri",
+    ).split(",") if s.strip())
 CLOUDFRONT_SUFFIX = "cloudfront.net"
 
 
@@ -271,7 +280,8 @@ def _load_ip_blocks():
         blocks = []
         for b in data.get("blocks", []):
             try:
-                blocks.append((ipaddress.ip_network(b["cidr"]), b["location"], b["cidr"]))
+                blocks.append((ipaddress.ip_network(b["cidr"]), b["location"], b["cidr"],
+                               bool(b.get("always"))))
             except (KeyError, ValueError):
                 continue
         return blocks
@@ -290,7 +300,7 @@ def classify_ip_location(ip: str) -> Optional[IpLocation]:
         return None
     # Tier 4: explicit CSAA blocks, longest-prefix match wins.
     best = None
-    for net, label, cidr in _IP_BLOCKS:
+    for net, label, cidr, _always in _IP_BLOCKS:
         if addr.version == net.version and addr in net:
             if best is None or net.prefixlen > best[0].prefixlen:
                 best = (net, label, cidr)
@@ -302,6 +312,42 @@ def classify_ip_location(ip: str) -> Optional[IpLocation]:
                           location="Private/RFC1918 (internal, not attributed to an AWS resource)",
                           source="rfc1918")
     return IpLocation(ip=ip, location="Public internet (outside CSAA)", source="public")
+
+
+def forced_ip_location(ip: str) -> Optional[IpLocation]:
+    """Location for an IP in a block marked "always": true in ip_blocks.json
+    (e.g. 192.168.0.0/16 -> PDC). These win over AWS ENI/subnet/VPC matches,
+    because the range is also used inside AWS (API Hub VPC) and AWS matches
+    there would mislabel on-prem hosts."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    best = None
+    for net, label, cidr, always in _IP_BLOCKS:
+        if always and addr.version == net.version and addr in net:
+            if best is None or net.prefixlen > best[0].prefixlen:
+                best = (net, label, cidr)
+    if best:
+        return IpLocation(ip=ip, location=best[1], cidr=best[2], source="cidr-list-always")
+    return None
+
+
+# On-prem server naming: n (non-prod) or p (prod), two digits, then letters,
+# e.g. n01awl424. Hosts named this way are always shown as PDC.
+PDC_HOSTNAME_RE = re.compile(r"^[np]\d{2}[a-z]")
+
+
+def is_pdc_hostname(hostname: str) -> bool:
+    first = (hostname or "").split(".", 1)[0].lower()
+    return bool(PDC_HOSTNAME_RE.match(first))
+
+
+def pdc_location(ip: str) -> IpLocation:
+    """PDC label for an IP of a PDC-named host, keeping the CIDR if it's listed."""
+    loc = classify_ip_location(ip)
+    cidr = loc.cidr if loc and loc.source == "cidr-list" else None
+    return IpLocation(ip=ip, location="PDC", cidr=cidr, source="hostname-convention")
 
 
 class InfraResolver:
@@ -971,7 +1017,14 @@ class InfraResolver:
             step.setdefault("destinations", []).append(dest)
 
     # ---- Per-IP attribution: tier 1 -> 2/3 -> 4/5 -------------------------
-    def attribute_ip(self, ip: str, result: ResolveResult, seen: set, source_tag: str) -> None:
+    def attribute_ip(self, ip: str, result: ResolveResult, seen: set, source_tag: str,
+                     pdc_host: bool = False) -> None:
+        # Fixed rules first: a PDC-named host, or an IP in an "always" block
+        # (192.168.0.0/16), is PDC regardless of any AWS match.
+        loc = pdc_location(ip) if pdc_host else forced_ip_location(ip)
+        if loc:
+            result.ip_locations.append(asdict(loc))
+            return
         # Tier 1: exact ENI.
         enis = self.attribute_ip_eni(ip, source=source_tag)
         real = [m for m in enis if m.account_id]
@@ -1000,11 +1053,31 @@ class InfraResolver:
     # ---- Orchestration ----------------------------------------------------
     def resolve(self, url: str) -> ResolveResult:
         hostname = _hostname_from_url(url)
+        short_name = None
+        if hostname and "." not in hostname:
+            # Short name (e.g. on-prem server n01awl424). The server's own DNS
+            # search list only has AWS suffixes, so try the CSAA ones in a CSAA
+            # workstation's order and use the first that resolves.
+            short_name = hostname
+            for suffix in DNS_SEARCH_SUFFIXES:
+                fqdn = f"{short_name}.{suffix}"
+                if self.resolve_dns(fqdn)[0]:
+                    hostname = fqdn
+                    break
         result = ResolveResult(url=url, hostname=hostname)
 
         ips, dns_err, name_not_found = self.resolve_dns(hostname)
         result.resolved_ips = ips
         result.dns_error = dns_err
+        if short_name:
+            if hostname != short_name:
+                result.notes.append(f"Short name '{short_name}' expanded to {hostname}.")
+            else:
+                # Not proof the host doesn't exist: only these suffixes were tried.
+                name_not_found = False
+                result.notes.append(
+                    f"'{short_name}' is a short name and was not found under the CSAA DNS "
+                    f"suffixes ({', '.join(DNS_SEARCH_SUFFIXES)}). Try the full name.")
 
         self.lookup_route53(hostname, result)
 
@@ -1027,9 +1100,18 @@ class InfraResolver:
             result.notes.append(
                 "Resolved IPs are shared Amazon S3 endpoints; they don't show where the bucket lives.")
 
+        # PDC server naming (e.g. n01awl424): all its IPs are shown as PDC.
+        pdc_host = is_pdc_hostname(hostname)
+        if pdc_host and ips:
+            result.notes.append(
+                f"'{hostname.split('.', 1)[0]}' follows the PDC server naming convention "
+                "(n or p, two digits, then letters), so it is shown as PDC.")
+
         # Live-DNS IPs.
         for ip in ips:
-            if _is_private_ip(ip):
+            if pdc_host:
+                result.ip_locations.append(asdict(pdc_location(ip)))
+            elif _is_private_ip(ip):
                 self.attribute_ip(ip, result, seen, source_tag="dns-ip")
             elif is_s3_host:
                 continue  # shared S3 front-end IP, not the bucket's location
@@ -1047,7 +1129,8 @@ class InfraResolver:
                 if ":" in val:
                     continue  # IPv6 (AAAA value): not shown, same as live DNS
                 if _is_private_ip(val):
-                    self.attribute_ip(val, result, seen, source_tag="a-record-ip")
+                    self.attribute_ip(val, result, seen, source_tag="a-record-ip",
+                                      pdc_host=pdc_host)
                 elif val.endswith(CLOUDFRONT_SUFFIX):
                     for m in self.attribute_cloudfront_by_domain(val):
                         if m.account_id:
@@ -1143,6 +1226,13 @@ class InfraResolver:
                 result.notes.append(
                     "No AWS resource/network match and no Route53 record found.")
 
+        # The same IP can come from live DNS and a Route 53 record; list it once.
+        uniq, seen_ips = [], set()
+        for loc in result.ip_locations:
+            if loc.get("ip") not in seen_ips:
+                seen_ips.add(loc.get("ip"))
+                uniq.append(loc)
+        result.ip_locations = uniq
         result.matches = [asdict(m) if not isinstance(m, dict) else m for m in result.matches]
         return result
 
