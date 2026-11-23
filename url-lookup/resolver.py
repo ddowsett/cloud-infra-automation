@@ -327,9 +327,13 @@ class InfraResolver:
             # and nothing in the CSAA estate is attributed by IPv6.
             infos = socket.getaddrinfo(hostname, None, socket.AF_INET)
             ips = sorted({i[4][0] for i in infos})
-            return ips, None
+            return ips, None, False
+        except socket.gaierror as e:
+            # EAI_NONAME = the DNS server says the name doesn't exist (NXDOMAIN).
+            # Other errors (timeouts, no IPv4 address) don't prove that.
+            return [], f"{type(e).__name__}: {e}", e.errno == socket.EAI_NONAME
         except Exception as e:  # noqa: BLE001
-            return [], f"{type(e).__name__}: {e}"
+            return [], f"{type(e).__name__}: {e}", False
 
     # ---- Config inventories (cached) --------------------------------------
     def _select_all(self, expr: str) -> list:
@@ -998,7 +1002,7 @@ class InfraResolver:
         hostname = _hostname_from_url(url)
         result = ResolveResult(url=url, hostname=hostname)
 
-        ips, dns_err = self.resolve_dns(hostname)
+        ips, dns_err, name_not_found = self.resolve_dns(hostname)
         result.resolved_ips = ips
         result.dns_error = dns_err
 
@@ -1130,8 +1134,14 @@ class InfraResolver:
                         break
 
         if not result.matches and not result.ip_locations and not result.zone_records:
-            result.notes.append(
-                "No AWS resource/network match and no Route53 record found.")
+            if name_not_found:
+                # Shown first: it's the plain answer to "why is there nothing here?"
+                result.notes.insert(0,
+                    "This name does not exist in DNS: the lookup returned 'name not found', "
+                    "and no Route 53 record exists for it. Check the spelling and domain.")
+            else:
+                result.notes.append(
+                    "No AWS resource/network match and no Route53 record found.")
 
         result.matches = [asdict(m) if not isinstance(m, dict) else m for m in result.matches]
         return result
